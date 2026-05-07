@@ -64,12 +64,15 @@ CLAUDE.md             Full implementation guide (llama.cpp integration, wire for
 
 ## llama.cpp Integration
 
-The SCLP type is integrated into a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The fork lives at `/home/ajkerchum/llama.cpp` (branch `sclp`). Changes:
+SCLP-compressed GGUFs can be run directly with our fork of llama.cpp:
+**[github.com/KerchumA222/llama.cpp](https://github.com/KerchumA222/llama.cpp) — branch `sclp`**
+
+Changes on top of upstream llama.cpp:
 
 - `GGML_TYPE_SCLP = 42` registered in `ggml.h` / `ggml.c`
 - `GGMLQuantizationType.SCLP = 42` in `gguf-py`
 - On-device decode via `sclp_bridge.cuh` — self-parses blob header in shared memory, safe during HIP graph capture
-- Fused decode-GEMV kernel for single-token (M=1) inference path
+- Fused decode-GEMV kernel for single-token (M=1) inference path (~49 t/s vs ~52 t/s FP16 on RX 7900 XTX)
 - GGUF loader supports both padded and compact blob formats via `disk_size` field
 
 ## Quick Start
@@ -84,11 +87,11 @@ The SCLP type is integrated into a fork of [llama.cpp](https://github.com/ggml-o
 
 ```bash
 # Clone this repo
-git clone <this-repo> sclp-research
+git clone https://github.com/KerchumA222/sclp sclp-research
 cd sclp-research
 
 # Clone the llama.cpp fork (sclp branch) as a sibling directory
-git clone -b sclp <llama-cpp-fork-url> llama.cpp
+git clone -b sclp https://github.com/KerchumA222/llama.cpp llama.cpp
 
 # Create a venv and install Python dependencies
 python3 -m venv eval_env
