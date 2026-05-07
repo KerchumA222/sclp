@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@ extern "C" {
     void launch_clip_kernel(const uint16_t* input, uint16_t* output, unsigned int num_weights, unsigned char threshold, unsigned int seed, uint8_t mantissa_mask);
     void launch_encode_kernel(const uint16_t* input, const uint8_t* lookup, uint8_t* packed, uint8_t* sm, uint32_t num_weights);
     void launch_decode_kernel(const uint8_t* packed, const uint8_t* sm, const uint8_t* palette, uint16_t* output, uint32_t num_weights);
+    void launch_fused_gemm(const uint16_t* A, const uint8_t* packed, const uint8_t* sm, const uint8_t* palette, uint16_t* C, int M, int N, int K);
 }
 
 PYBIND11_MODULE(testmodule, m) {
@@ -207,4 +209,38 @@ PYBIND11_MODULE(testmodule, m) {
     py::arg("sidecar_indices") = py::array_t<uint32_t>(0),
     py::arg("sidecar_values")  = py::array_t<uint16_t>(0),
     "Decode nibble-packed palette indices and SM stream back to BF16 weights, applying sidecar");
+
+    m.def("fused_gemm", [](py::array_t<uint16_t> A, py::array_t<uint8_t> packed, py::array_t<uint8_t> sm, py::array_t<uint8_t> palette, int M, int N, int K) {
+        auto buf_a = A.request();
+        auto buf_packed = packed.request();
+        auto buf_sm = sm.request();
+        auto buf_pal = palette.request();
+
+        py::array_t<uint16_t> C(M * N);
+        auto buf_c = C.request();
+
+        uint16_t *d_A, *d_C;
+        uint8_t *d_packed, *d_sm, *d_palette;
+        CHECK_HIP(hipMalloc(&d_A, M * K * sizeof(uint16_t)));
+        CHECK_HIP(hipMalloc(&d_C, M * N * sizeof(uint16_t)));
+        CHECK_HIP(hipMalloc(&d_packed, packed.size()));
+        CHECK_HIP(hipMalloc(&d_sm, sm.size()));
+        CHECK_HIP(hipMalloc(&d_palette, palette.size()));
+
+        CHECK_HIP(hipMemcpy(d_A, buf_a.ptr, M * K * sizeof(uint16_t), hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_packed, buf_packed.ptr, packed.size(), hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_sm, buf_sm.ptr, sm.size(), hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_palette, buf_pal.ptr, palette.size(), hipMemcpyHostToDevice));
+
+        launch_fused_gemm((const uint16_t*)d_A, (const uint8_t*)d_packed, (const uint8_t*)d_sm, (const uint8_t*)d_palette, (uint16_t*)d_C, M, N, K);
+
+        CHECK_HIP(hipMemcpy(buf_c.ptr, d_C, M * N * sizeof(uint16_t), hipMemcpyDeviceToHost));
+
+        CHECK_HIP(hipFree(d_A));
+        CHECK_HIP(hipFree(d_C));
+        CHECK_HIP(hipFree(d_packed));
+        CHECK_HIP(hipFree(d_sm));
+        CHECK_HIP(hipFree(d_palette));
+        return C;
+    }, "Fused SCLP-GEMM kernel");
 }

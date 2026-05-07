@@ -104,9 +104,17 @@ A learned codebook (k-means / vector quantization) is a natural upgrade over the
 
 ## 5. GPU Inference Kernel
 
-### 5.1 Fused Decode-GEMM Kernel
+### 5.2 Fused Decode-GEMM (Research Path)
 
-GEMM (General Matrix Multiply, C = A × B) is the enough dominant operation in every transformer layer. The kernel fuses weight decompression with this matrix multiplication so that decompressed values never exist in VRAM — they go directly from decode logic into the matrix multiply hardware.
+To achieve maximum efficiency on consumer hardware (RDNA3), we are developing a Fused SCLP-GEMM approach.
+
+- **Option A: Transcoder Bridge (Current Baseline):** Transcode compressed weights to BF16 via a highly-optimized vectorized HIP kernel, then pass to `rocBLAS` or a standard GEMM library. This minimizes the compute overhead of decompression.
+- **Option B: Fused Tiled-GEMM (Research):** Custom tiled-GEMM kernel where tiles of compressed SCLP data are loaded into Shared Memory (LDS), transcoded to BF16 on-the-fly in registers, and passed to hardware matrix cores (WMMA).
+
+**Research Plan:**
+1. Develop a high-speed Transcoder Bridge kernel.
+2. If memory bandwidth remains the bottleneck (as suggested by our current 94% throughput efficiency), focus on maximizing bridge performance.
+3. If compute becomes the bottleneck, implement the Fused Tiled-GEMM using WMMA.
 
 Per-weight operations inside the kernel (all fixed-width, branchless):
 

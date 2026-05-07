@@ -35,6 +35,7 @@ add_library(hip_kernels STATIC
     encoder.hip
     decoder.hip
     launcher.hip
+    fused_gemm.hip
 )
 set_target_properties(hip_kernels PROPERTIES HIP_STANDARD 17)
 

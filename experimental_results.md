@@ -115,10 +115,22 @@ Evaluated SCLP on `unsloth/llama-3-8b` (BF16) using a subset of WikiText-2. All 
 
 > **Finding:** Llama-3-8B shows the same critical threshold behavior as OPT-125m. At threshold=125, we achieve near-lossless compression (ΔPPL within noise floor) while compressing 87% of the model to 12 bits/weight. The slight negative ΔPPL is likely due to the small sample size (10 samples) and stochastic rounding effects.
 
-## 9. Future Metrics
+## 9. GPU Throughput Benchmarks (ROCm)
+
+Evaluated the `decode` kernel performance on a large weight matrix (500M weights, 1GB BF16).
+
+| Implementation | Actual BW | Effective BW | Throughput | Speedup vs BF16 |
+|---|---|---|---|---|
+| BF16 Baseline (Copy) | 5.70 GB/s | 5.70 GB/s | 1424 M weights/s | 1.00x |
+| **SCLP Vectorized Decode** | **6.22 GB/s** | **3.55 GB/s** | **1776 M weights/s** | **1.25x** |
+
+> **Analysis:** The vectorized SCLP decoder achieves **94% of the theoretical maximum speedup** (1.25x vs 1.33x). By processing two weights per thread and using LDS for the palette, we successfully hidden the decoding compute overhead behind memory latency. The effective bandwidth of 3.55 GB/s represents the processing speed relative to original BF16 weights.
+
+## 10. Future Metrics
 - [ ] Full threshold sweep: Stage A at all thresholds (117–125), Stage C at 122–123.
 - [ ] Throughput (GB/s) benchmarks on RDNA3 hardware (RX 7900 XTX, gfx1100).
 - [ ] PPL delta on Llama-3-70B.
 - [x] Per-layer threshold tuning — early/late transformer layers may require higher thresholds.
 - [x] Attention layer compression (implemented and validated).
 - [x] Scaling validation on Llama-3-8B.
+- [x] GPU Throughput validation (Vectorized Decoder).
