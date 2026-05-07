@@ -193,3 +193,19 @@ Baseline: two-pass decode-to-buffer → rocBLAS GEMM.
 | FP16 rocBLAS baseline | ~52 |
 | SCLP two-pass (decode → GEMM) | ~16 |
 | SCLP fused decode-GEMV | ~49 |
+
+## 12. Compact GGUF Format — Disk Savings (Llama-3-8B, 2026-05-06)
+
+*Tool: `tests/repack_sclp_gguf.py`. Input: padded SCLP GGUF. Hardware: AMD RX 7900 XTX.*
+
+The padded SCLP GGUF format allocates `num_weights * 2` bytes per tensor slot (matching BF16 stride), leaving the gap between the actual compressed blob end and the slot boundary as zero padding. The compact format stores each blob at its actual size, padded only to 32-byte GGUF alignment.
+
+| Tensor type | Size (padded) | Size (compact) | Ratio |
+|---|---|---|---|
+| SCLP tensors (224 total) | 13.00 GB | 9.75 GB | 1.333× |
+| Non-SCLP tensors (67 total) | 1.97 GB | 1.97 GB | 1.000× |
+| **Total file** | **14.97 GB** | **11.72 GB** | **1.277×** |
+
+**Savings: 3.25 GB (21.7% reduction).**
+
+The compact format is fully supported by the modified loader — inference verified correct at ~46 t/s on the compact file (identical output to padded format). The SCLP decode kernel self-parses the blob header on-device so it is unaffected by the change in on-disk allocation.
