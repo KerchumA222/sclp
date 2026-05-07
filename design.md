@@ -104,28 +104,40 @@ A learned codebook (k-means / vector quantization) is a natural upgrade over the
 
 ## 5. GPU Inference Kernel
 
+### 5.1 Transcoder Bridge (Implemented — llama.cpp Integration)
+
+The Transcoder Bridge approach is implemented and working end-to-end in the llama.cpp `sclp` branch on RX 7900 XTX (gfx1100). All 224 linear projections of Llama 3 8B are compressed. Observed: ~16 t/s compressed / ~52 t/s FP16 baseline. The 3x overhead is expected for the bridge (extra decode + memory pass per matmul) and will be eliminated by the fused decode-GEMM path.
+
+**Architecture:**
+- `sclp_bridge.cuh` contains two on-device kernels and a dispatch function:
+  - `sclp_decode_blob_kernel`: reads blob header on-device (palette_size at `blob[4]`, palette at `blob[5..]`), decodes packed indices + sm_stream to BF16, writes to a pool-allocated output buffer. All fixed-width, branchless.
+  - `sclp_fixup_sidecar_kernel`: reads `sidecar_count` from `blob[sm_end..]` on-device, then scatter-writes each outlier weight's exact BF16 value into the output buffer. Grid-stride loop with 4 fixed blocks handles any sidecar count without a D2H read.
+  - `llama_sclp_dispatch`: sizes decode grid proportional to `num_weights`, launches fixup with 4 fixed blocks.
+- The dispatch intercepts at the top of `ggml_cuda_mul_mat`: when `src0->type == GGML_TYPE_SCLP`, the blob is decoded into a pool-allocated `uint16_t` buffer, the tensor type is patched to `GGML_TYPE_BF16` in a stack copy, and the function recurses through the standard BF16 matmul path (rocBLAS / hipBLAS).
+- Because `GGML_TYPE_SCLP` has `type_size=2` (same as BF16), all tensor strides are correct for BF16 without adjustment.
+
+Per-weight decode operations inside `sclp_decode_blob_kernel` (fixed-width, branchless):
+1. Load 4-bit palette index from packed index stream
+2. Decode exponent via shared-memory palette lookup (palette cached in `__shared__ uint8_t s_palette[16]`)
+3. Reconstruct BF16: `((sign >> 7) << 15) | (exp << 7) | (mantissa & 0x7F)`
+4. (After main decode) Sidecar fixup restores ~0.012% of weights that had exponents outside top-16 palette
+
+**HIP graph capture constraint**: All header parsing must happen on-device. `hipMemcpyAsync D2H` and `hipStreamSynchronize` are forbidden during HIP graph stream capture (`GGML_HIP_GRAPHS=ON`) and cause `ROCm error: operation failed due to a previous error during capture`. Both kernels use shared-memory reads for all blob metadata — no host-side device reads, graph-safe.
+
 ### 5.2 Fused Decode-GEMM (Research Path)
 
-To achieve maximum efficiency on consumer hardware (RDNA3), we are developing a Fused SCLP-GEMM approach.
+To achieve maximum efficiency on consumer hardware (RDNA3), a Fused SCLP-GEMM approach remains the long-term research direction:
 
-- **Option A: Transcoder Bridge (Current Baseline):** Transcode compressed weights to BF16 via a highly-optimized vectorized HIP kernel, then pass to `rocBLAS` or a standard GEMM library. This minimizes the compute overhead of decompression.
-- **Option B: Fused Tiled-GEMM (Research):** Custom tiled-GEMM kernel where tiles of compressed SCLP data are loaded into Shared Memory (LDS), transcoded to BF16 on-the-fly in registers, and passed to hardware matrix cores (WMMA).
+- **Option B: Fused Tiled-GEMM (Research):** Custom tiled-GEMM kernel where tiles of compressed SCLP data are loaded into Shared Memory (LDS), transcoded to BF16 on-the-fly in registers, and passed to hardware matrix cores (WMMA). Eliminates the intermediate BF16 pool allocation and the second pass over the data.
 
 **Research Plan:**
-1. Develop a high-speed Transcoder Bridge kernel.
-2. If memory bandwidth remains the bottleneck (as suggested by our current 94% throughput efficiency), focus on maximizing bridge performance.
+1. ~~Develop a high-speed Transcoder Bridge kernel.~~ ✓ Done — bridge implemented in `sclp_bridge.cuh`
+2. If memory bandwidth remains the bottleneck, focus on maximizing bridge performance and reducing pool allocation overhead.
 3. If compute becomes the bottleneck, implement the Fused Tiled-GEMM using WMMA.
-
-Per-weight operations inside the kernel (all fixed-width, branchless):
-
-1. Load 4-bit palette index from packed index stream (fixed-width load)
-2. Decode exponent via palette lookup → recover clipped exponent (single table lookup, palette in registers)
-3. Recombine exponent + sign + mantissa → BF16 value (bitwise OR of packed bytes, ~3–5 ALU instructions)
-4. Feed reconstructed BF16 value into MFMA accumulation (RDNA3) or Tensor Core (N/A for consumer NVIDIA)
 
 The reconstruct-then-MFMA sequence is designed so that decode ALU instructions are issued during memory latency of the next tile load, keeping the matrix units fully fed.
 
-### 5.2 Target Architecture Details
+### 5.3 Target Architecture Details (RDNA3 Primary)
 
 | Property | AMD RDNA3 | AMD CDNA3 (MI300X) | NVIDIA Ada (RTX 4090) | Apple M-series |
 |---|---|---|---|---|
@@ -137,7 +149,7 @@ The reconstruct-then-MFMA sequence is designed so that decode ALU instructions a
 
 **Note on INT8 compute:** INT8 and BF16 MFMA use the same physical Matrix Core hardware on RDNA3, reconfigured per instruction. INT8 is ~2x faster in raw throughput but the advantage only materialises when the workload is compute-bound. Consumer single-user inference at batch size 1 is memory-bandwidth-bound, so the INT8 throughput advantage is largely irrelevant in that regime. The primary benefit of INT8 in this system is smaller weights (fewer bytes loaded from VRAM), not faster arithmetic.
 
-### 5.3 Known Kernel Bottlenecks
+### 5.4 Known Kernel Bottlenecks
 
 | Bottleneck | Detail and Mitigation |
 |---|---|
@@ -194,7 +206,8 @@ While the GPU computes layer N's GEMM, a separate HIP stream decodes layer N+1's
 - **Clipping Sensitivity:** Per-layer clipping sensitivity is theoretically bounded but empirically unknown for specific models.
 - **RDNA3 MFMA occupancy:** The combined LDS requirements of the palette buffer and MFMA tile buffers may force lower wavefront occupancy than expected.
 - **Speculative decoding acceptance rate variability:** Effectiveness depends on the match between draft network and base model distribution.
-- **llama.cpp integration complexity:** Adding a new quant type that only benefits CUDA/ROCm paths might face resistance from llama.cpp maintainers who prioritise cross-backend simplicity.
+- ~~**llama.cpp integration complexity:** Adding a new quant type that only benefits CUDA/ROCm paths might face resistance from llama.cpp maintainers who prioritise cross-backend simplicity.~~ **Resolved.** SCLP type registered as `GGML_TYPE_SCLP = 42`, bridge wired into `ggml-cuda.cu`, inference verified end-to-end on RX 7900 XTX. Key lessons: (1) `supports_op` switch must include SCLP for MUL_MAT or model load crashes; (2) HIP graph capture forbids any D2H memcpy — kernel must be fully self-parsing on-device.
+- ~~**GGUF blob format lacks sidecar:**~~ **Resolved.** Sidecar is now embedded after the sm_stream in the GGUF blob (`[uint32 sidecar_count][uint32[] indices][uint16[] values]`). The GPU kernel (`sclp_fixup_sidecar_kernel`) restores outlier weights exactly via on-device scatter writes. Observed sidecar fraction: 0.012% of weights across Llama 3 8B. Compression is now fully lossless. Key lesson: typical BF16 LLM tensors have 17–25 unique exponents; the 1–9 per-tensor outlier exponents would cause cumulative quality degradation (up to 64× weight error per exponent step) that collapses model output — sidecar is required for correctness, not just precision.
 
 ---
 

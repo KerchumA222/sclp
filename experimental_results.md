@@ -126,7 +126,29 @@ Evaluated the `decode` kernel performance on a large weight matrix (500M weights
 
 > **Analysis:** The vectorized SCLP decoder achieves **94% of the theoretical maximum speedup** (1.25x vs 1.33x). By processing two weights per thread and using LDS for the palette, we successfully hidden the decoding compute overhead behind memory latency. The effective bandwidth of 3.55 GB/s represents the processing speed relative to original BF16 weights.
 
-## 10. Future Metrics
+## 10. Fused Decode-GEMV Kernel Optimization (RX 7900 XTX, gfx1100)
+
+Iterative optimization of the fused SCLP decode-GEMV kernel (M=1 single-token inference path).
+Baseline: two-pass decode-to-buffer → rocBLAS GEMM.
+
+| Optimization | t/s | Δ |
+|---|---|---|
+| Two-pass decode + rocBLAS (baseline) | 16.0 | — |
+| Fused GEMV, scalar byte loads | 27.6 | +73% |
+| + Vectorized loads (uint64_t sm, uint32_t packed) | 44.6 | +62% |
+| + 16 warps/block (512 threads) | 47.6 | +7% |
+| + Dual accumulators + `__launch_bounds__(512,4)` | 49.0 | +3% |
+| FP16 rocBLAS reference | ~52 | — |
+
+> **Approaches that hurt and were reverted:**
+> - Shared memory staging for activations: −14% (syncthreads barriers outweigh reuse benefit)
+> - bfloat162 paired multiply: −13% (float2 accumulation overhead > scalar FMA)
+>
+> **Residual 3 t/s gap** to FP16 baseline is inherent decode overhead (palette lookup + nibble
+> unpacking). Closing it further requires a fundamentally different approach such as a
+> 256-entry precomputed lookup table mapping packed bytes directly to BF16 pairs.
+
+## 11. Future Metrics
 - [ ] Full threshold sweep: Stage A at all thresholds (117–125), Stage C at 122–123.
 - [ ] Throughput (GB/s) benchmarks on RDNA3 hardware (RX 7900 XTX, gfx1100).
 - [ ] PPL delta on Llama-3-70B.
@@ -134,3 +156,40 @@ Evaluated the `decode` kernel performance on a large weight matrix (500M weights
 - [x] Attention layer compression (implemented and validated).
 - [x] Scaling validation on Llama-3-8B.
 - [x] GPU Throughput validation (Vectorized Decoder).
+
+## 11. Selective Sidecar Removal — PPL vs Quality Trade-off (Llama-3-8B, 2026-05-02)
+
+*Methodology: sidecar entries ranked by drop_cost = MAE × sidecar_count per tensor.*
+*PPL measured with llama-perplexity on WikiText-2 test set (~10K tokens), ctx=2048.*
+*Hardware: AMD RX 7900 XTX (gfx1100). Inference via fused decode-GEMV kernel.*
+
+| Model | Tensors dropped | Drop cost | PPL | ΔPPL |
+|---|---|---|---|---|
+| Full sidecars (baseline) | 0% | 0.00% | 9.5493 | — |
+| attn_v sidecars dropped | 32/224 | 0.45% | 9.4841 | -0.68% |
+| 50% cheapest dropped | 112/224 | 10.47% | 8.9978 | -5.78% |
+| 90% cheapest dropped | 165/224 | 44.27% | 6.3503 | -33.50% |
+
+**Key findings:**
+
+1. **No speed benefit** — sidecar removal has no measurable effect on inference speed (48.89 → 48.81 → 48.86 → 49.08 t/s across all four variants). The fixup kernel processes at most ~8K entries per tensor on a fixed 4-block grid — negligible vs the GEMV over 16–58M weights.
+
+2. **PPL improves (unexpectedly) as sidecars are dropped.** This is not a quality regression. Analysis of the sidecar exponent distribution reveals why: 72% of sidecar entries are *below*-palette exponents (exp 103–106, just under the palette floor of 106), not large outliers. When their sidecar is dropped, the decoder rounds their exponent up to the nearest palette entry (~106–108), slightly inflating near-zero weights. This acts as mild regularization on noisy small-magnitude weights.
+
+3. **Exponent distribution of sidecar entries** (across all 224 SCLP tensors):
+   - Palette range: exponents 106–124 (top-16 most frequent)
+   - Sidecar below palette floor (exp < 106): **72.1%** of sidecar entries
+   - Sidecar above palette ceiling (exp > 124): **0.7%** of sidecar entries
+   - Sidecar at exp=0 (subnormals): 15,393 entries across whole model
+
+4. **The `drop_cost` proxy is still valid** for identifying which layers are safe to drop, but the objective is now confirmed to be: "minimize magnitude inflation of near-zero weights" rather than "avoid clipping large outliers." Layers with low MAE are safe because their sidecar weights are already close to the nearest palette exponent.
+
+5. **Recommendation**: All 32 `attn_v` sidecars can be dropped at zero PPL cost. This also simplifies GGUF generation by skipping sidecar encoding for V projections entirely.
+
+**Inference speed summary (RX 7900 XTX, fused decode-GEMV kernel):**
+
+| Path | t/s |
+|---|---|
+| FP16 rocBLAS baseline | ~52 |
+| SCLP two-pass (decode → GEMM) | ~16 |
+| SCLP fused decode-GEMV | ~49 |

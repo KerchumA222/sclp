@@ -124,3 +124,88 @@ VERSION 1 files (no sidecar) load correctly with an empty sidecar.
 - `testmodule.encode(input, palette)` accepts the palette array (≤16 uint8 exponent values); the wrapper builds the nearest-neighbour lookup internally
 - `testmodule.decode(packed, sm, palette, sidecar_indices=[], sidecar_values=[])` — sidecar args are optional
 - The `mantissa_mask` parameter of `clip` is applied as `output = weight & (0xFF80 | mantissa_mask)`; pass `0x7F` to preserve all mantissa bits
+
+## llama.cpp Integration
+
+The llama.cpp integration lives on the `sclp` branch at `/home/ajkerchum/llama.cpp`.
+
+### Build (llama.cpp sclp branch)
+
+```bash
+cd /home/ajkerchum/llama.cpp
+cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100
+cmake --build build --config Release -j$(nproc)
+```
+
+### GGUF Blob Wire Format
+
+The SCLP payload stored inside a GGUF tensor slot is **not** the same as the standalone `.sclp` file format — no magic bytes, no version field. It is a minimal self-describing blob sized to exactly `num_weights * 2` bytes (identical to BF16), so all GGUF tensor offsets and strides are unchanged:
+
+```
+[uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
+[packed_indices (ceil(num_weights/2) bytes)][sm_stream (num_weights bytes)]
+[uint32 sidecar_count]
+[uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
+[zero padding to fill num_weights*2 bytes total]
+```
+
+Weights whose exponents fall outside the top-16 palette are stored verbatim in the sidecar section and restored exactly by `sclp_fixup_sidecar_kernel` after the main decode. The sidecar is typically 0.01–0.03% of all weights (lossless). The GGUF blob is sized to `num_weights * 2` regardless of sidecar count — the sidecar data fits within the natural padding between the compressed streams and the allocation boundary.
+
+### Generating a Patched GGUF
+
+To compress a single tensor in an existing GGUF using binary in-place patching:
+
+```bash
+source eval_env/bin/activate
+python3 tests/patch_gguf_sclp.py
+```
+
+Edit the paths at the bottom of `patch_gguf_sclp.py` to choose input file, output file, and target tensor name. The script copies the file then seeks and overwrites only the 4-byte type field in the tensor-info section and the tensor data bytes — all other GGUF offsets stay valid.
+
+**F16→BF16 conversion is required.** If the source GGUF stores weights as F16 (e.g. `Meta-Llama-3-8B.fp16.gguf`), the `to_bf16_uint16()` helper converts via a float32 intermediate before encoding. Passing raw F16 bits to the SCLP encoder produces garbage output — the encoder treats all bits as BF16 1-8-7 layout, but F16 has a 5-bit exponent and 10-bit mantissa (1-5-10).
+
+### Generating a Native SCLP GGUF (from HuggingFace)
+
+To convert a HuggingFace checkpoint directly to a full SCLP GGUF (all linear projections compressed):
+
+```bash
+source eval_env/bin/activate
+python3 tests/convert_to_sclp_gguf.py
+```
+
+### Running Inference
+
+```bash
+/home/ajkerchum/llama.cpp/build/bin/llama-completion \
+    -m /home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLP-Patched.gguf \
+    -ngl 99 \
+    -n 100 \
+    -no-cnv \
+    --repeat-penalty 1.3 \
+    -p "The capital of France is"
+```
+
+Use `llama-completion`, not `llama-cli`. `llama-cli` does not support `-no-cnv`. Both binaries auto-enable conversation mode when the GGUF contains an embedded chat template (Llama 3 does) — `-no-cnv` forces raw completion. `--repeat-penalty 1.3` prevents repetition loops common in base model completion. Verified working on RX 7900 XTX (gfx1100) at ~16 t/s compressed / ~52 t/s FP16 baseline. The 3x gap is transcoder bridge overhead (extra decode + memory pass per matmul); eliminated by the fused decode-GEMM path.
+
+### Bridge Architecture (`sclp_bridge.cuh`)
+
+`/home/ajkerchum/llama.cpp/ggml/src/ggml-cuda/sclp_bridge.cuh` implements the on-device decode path:
+
+- `sclp_decode_blob_kernel`: Self-parses the GGUF blob header on-device. Thread 0 reads `blob[4]` (palette_size) into `__shared__` memory, then all threads load the palette into `__shared__ uint8_t s_palette[16]`. Derives `packed` and `sm` pointer offsets from palette_size. No host-side device reads, safe during HIP stream capture.
+- `sclp_fixup_sidecar_kernel`: Reads `sidecar_count` from the blob on-device (after sm_stream), then each thread restores one outlier weight via scatter write into the output buffer. Uses a grid-stride loop with 4 fixed blocks so it handles any sidecar count without a D2H read. Threads where `i >= sidecar_count` return after one shared-memory read.
+- `llama_sclp_dispatch`: Launches both kernels sequentially on the same HIP stream. Decode grid is proportional to `num_weights`; fixup grid is fixed at 4 blocks.
+
+The dispatch is wired in at the top of `ggml_cuda_mul_mat` in `ggml-cuda.cu`: when `src0->type == GGML_TYPE_SCLP`, the blob is decoded into a pool-allocated `uint16_t` buffer, `src0_bf16` is constructed as a copy of `src0` with `type = GGML_TYPE_BF16` and `data = decoded.get()`, and the function recurses. Because `GGML_TYPE_SCLP` has `type_size=2` (same as BF16), all strides in `nb[]` are already correct for BF16 — no adjustment needed.
+
+**HIP graph capture constraint**: `hipMemcpyAsync D2H` and `hipStreamSynchronize` are illegal during HIP graph capture (`GGML_HIP_GRAPHS=ON`). Any host read of a device pointer (e.g. reading palette_size from the blob) causes `ROCm error: operation failed due to a previous error during capture`. All header parsing must happen on-device.
+
+### ggml Type Registration
+
+| Location | Change |
+|---|---|
+| `ggml/include/ggml.h` | `GGML_TYPE_SCLP = 42`, `GGML_TYPE_COUNT = 43` |
+| `ggml/src/ggml.c` | `[GGML_TYPE_SCLP] = { .type_name="sclp", .blck_size=1, .type_size=2, .is_quantized=true }` |
+| `gguf-py/gguf/constants.py` | `GGMLQuantizationType.SCLP = 42`, `GGML_QUANT_SIZES[SCLP] = (1, 2)` |
+| `ggml-cuda.cu` | SCLP intercept in `ggml_cuda_mul_mat`; `case GGML_TYPE_SCLP: return true;` in `supports_op` MUL_MAT switch |
+
+The `supports_op` entry is critical: without it, `select_weight_buft` returns `nullptr` during model loading and the process crashes.
