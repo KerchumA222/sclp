@@ -4,7 +4,8 @@ import os
 import numpy as np
 
 # Mocking parts of gguf-py structure for local testing
-sys.path.append(os.path.abspath('/home/ajkerchum/llama.cpp/gguf-py/'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _setup_paths  # noqa: F401
 from gguf import GGUFWriter, GGMLQuantizationType
 
 def test_sclp_gguf_writing():

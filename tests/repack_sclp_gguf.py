@@ -14,7 +14,8 @@ import sys
 import os
 import numpy as np
 
-sys.path.append(os.path.abspath('/home/ajkerchum/llama.cpp/gguf-py'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+import _setup_paths  # noqa: F401
 
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 from gguf.constants import GGUFValueType
@@ -56,7 +57,7 @@ def copy_kv(writer: GGUFWriter, reader: GGUFReader) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input',  default='/home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLP-Patched.gguf')
+    parser.add_argument('--input',  required=True, help='Input padded SCLP GGUF file')
     parser.add_argument('--output', default=None)
     args = parser.parse_args()
 

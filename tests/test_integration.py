@@ -2,7 +2,8 @@ import sys
 import os
 import numpy as np
 
-sys.path.append('/home/ajkerchum/poc/python_pkg')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _setup_paths  # noqa: F401
 
 try:
     import testmodule

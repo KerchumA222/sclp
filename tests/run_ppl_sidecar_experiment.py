@@ -8,11 +8,15 @@ Usage:
 """
 
 import subprocess, re, sys, os, datetime
+from pathlib import Path
 
-LLAMA_PPL = "/home/ajkerchum/llama.cpp/build/bin/llama-perplexity"
-WIKITEXT   = "/tmp/wikitext2_small.txt"
-RESULTS_MD = "/home/ajkerchum/poc/experimental_results.md"
-MODEL_DIR  = "/home/ajkerchum/poc/models/llama3"
+_REPO = Path(__file__).resolve().parent.parent
+
+# Paths — override with env vars if needed
+LLAMA_PPL  = os.environ.get('LLAMA_PPL',    str(_REPO.parent / 'llama.cpp' / 'build' / 'bin' / 'llama-perplexity'))
+WIKITEXT   = os.environ.get('WIKITEXT',     '/tmp/wikitext2_small.txt')
+RESULTS_MD = os.environ.get('RESULTS_MD',   str(_REPO / 'experimental_results.md'))
+MODEL_DIR  = os.environ.get('MODEL_DIR',    str(_REPO / 'models' / 'llama3'))
 
 # ctx=512 gives a reasonable PPL estimate quickly; stride=256 avoids positional leakage
 CTX    = 2048

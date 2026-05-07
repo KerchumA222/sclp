@@ -4,8 +4,8 @@ import struct
 import shutil
 import numpy as np
 
-sys.path.append(os.path.abspath('/home/ajkerchum/llama.cpp/gguf-py/'))
-sys.path.append(os.path.abspath('/home/ajkerchum/poc/src'))
+sys.path.insert(0, os.path.dirname(__file__))
+import _setup_paths  # noqa: F401
 
 from gguf import GGUFReader, GGMLQuantizationType
 from compression.encoder import encode_palette
@@ -118,7 +118,9 @@ def patch_gguf_with_sclp(input_path, output_path):
 
 
 if __name__ == "__main__":
-    patch_gguf_with_sclp(
-        "/home/ajkerchum/poc/models/llama3/Meta-Llama-3-8B.fp16.gguf",
-        "/home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLP-Patched.gguf",
-    )
+    import argparse
+    p = argparse.ArgumentParser(description="Patch a BF16/F16 GGUF by compressing target tensors with SCLP in-place.")
+    p.add_argument("--input",  required=True, help="Input BF16/F16 GGUF file")
+    p.add_argument("--output", required=True, help="Output patched GGUF file")
+    cli = p.parse_args()
+    patch_gguf_with_sclp(cli.input, cli.output)

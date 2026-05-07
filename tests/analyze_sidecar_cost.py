@@ -18,8 +18,8 @@ Usage:
 import sys, os, struct, argparse
 import numpy as np
 
-sys.path.append(os.path.abspath('/home/ajkerchum/llama.cpp/gguf-py'))
-sys.path.append(os.path.abspath('/home/ajkerchum/poc/src'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _setup_paths  # noqa: F401
 
 from gguf import GGUFReader, GGMLQuantizationType
 
@@ -180,7 +180,7 @@ def analyse(gguf_path: str, top_n: int, csv_path: str | None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gguf', default='/home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLP-Patched.gguf')
+    parser.add_argument('--gguf', required=True, help='Input SCLP GGUF file')
     parser.add_argument('--top',  type=int, default=15)
     parser.add_argument('--csv',  default=None)
     args = parser.parse_args()

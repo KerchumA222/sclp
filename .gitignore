@@ -56,3 +56,8 @@ Thumbs.db
 *.log
 data/
 models/
+SESSION_SNAPSHOT.md
+
+# Compiled HIP extension (build from src/hip/ with cmake)
+python_pkg/*.so
+python_pkg/*.pyd

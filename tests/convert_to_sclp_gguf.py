@@ -5,8 +5,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoConfig
 
-sys.path.append("/home/ajkerchum/llama.cpp/gguf-py")
-sys.path.append("/home/ajkerchum/poc/src")
+import _setup_paths  # noqa: F401
 
 from gguf import GGUFWriter, GGMLQuantizationType
 from compression.encoder import encode_palette
@@ -142,39 +141,13 @@ def convert_to_sclp(model_id, output_path):
 
 
 if __name__ == "__main__":
-    # Use existing FP16 GGUF and patch it in-place
-    import sys
-    import os
-    import struct
-    import shutil
-    import numpy as np
-    sys.path.append(os.path.abspath('/home/ajkerchum/llama.cpp/gguf-py/'))
-    sys.path.append(os.path.abspath('/home/ajkerchum/poc/src'))
-
-    from gguf import GGUFReader, GGMLQuantizationType
-    from compression.encoder import encode_palette
-
-    SCLP_TARGET_SUFFIXES = [
-        'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
-        'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight',
-    ]
-
-    def is_sclp_target(name: str) -> bool:
-        return any(name.endswith(s) for s in SCLP_TARGET_SUFFIXES)
-
-    def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -> np.ndarray:
-        raw = tensor_data.flatten()
-        if tensor_type == GGMLQuantizationType.BF16:
-            return raw.view(np.uint16)
-        if tensor_type == GGMLQuantizationType.F16:
-            f32 = raw.view(np.float16).astype(np.float32)
-            return (f32.view(np.uint32) >> 16).astype(np.uint16)
-        if tensor_type == GGMLQuantizationType.F32:
-            return (raw.view(np.float32).view(np.uint32) >> 16).astype(np.uint16)
-        raise ValueError(f"Unsupported source type: {tensor_type}")
-
-    input_path = "/home/ajkerchum/poc/models/llama3/Meta-Llama-3-8B.fp16.gguf"
-    output_path = "/home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLP-Compressed.gguf"
+    import argparse
+    p = argparse.ArgumentParser(description="Convert a BF16/F16 GGUF to SCLP format.")
+    p.add_argument("--input",  required=True, help="Input BF16/F16 GGUF file")
+    p.add_argument("--output", required=True, help="Output SCLP GGUF file")
+    cli = p.parse_args()
+    input_path  = cli.input
+    output_path = cli.output
 
     print(f"Reading {input_path}...")
     reader = GGUFReader(input_path, mode='r')
