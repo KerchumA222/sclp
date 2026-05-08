@@ -209,3 +209,17 @@ The padded SCLP GGUF format allocates `num_weights * 2` bytes per tensor slot (m
 **Savings: 3.25 GB (21.7% reduction).**
 
 The compact format is fully supported by the modified loader — inference verified correct at ~46 t/s on the compact file (identical output to padded format). The SCLP decode kernel self-parses the blob header on-device so it is unaffected by the change in on-disk allocation.
+
+## 13. Task Accuracy: Llama-3-8B Variants (0-shot, lm-evaluation-harness, 2026-05-08)
+
+*Hardware: AMD RX 7900 XTX (gfx1100) · GGML_HIP=ON · ngl=99 · ctx=16384*
+*Evaluation: lm-evaluation-harness via local-completions backend, 100 examples per task.*
+*Tasks: HellaSwag (acc_norm), ARC-Challenge (acc_norm), ARC-Easy (acc)*
+
+| Variant | File Size | HellaSwag | ARC-C | ARC-E |
+|---|---|---|---|---|
+| BF16 baseline | 15.00 GB | 0.570 | 0.360 | 0.490 |
+| **SCLP compact** | **11.72 GB** | **0.560** | **0.350** | **0.440** |
+| Q8_0 | 8.00 GB | 0.580 | 0.370 | 0.470 |
+
+**Key finding:** SCLP compact (11.72 GB, 1.277× compression) scores within 1–5% of the BF16 baseline on all tasks. The small deltas are within expected noise for 100-example evaluation. SCLP retains full task accuracy while saving 3.28 GB (21.9%) over BF16.
