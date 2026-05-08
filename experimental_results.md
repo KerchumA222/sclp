@@ -223,3 +223,25 @@ The compact format is fully supported by the modified loader — inference verif
 | Q8_0 | 8.00 GB | 0.580 | 0.370 | 0.470 |
 
 **Key finding:** SCLP compact (11.72 GB, 1.277× compression) scores within 1–5% of the BF16 baseline on all tasks. The small deltas are within expected noise for 100-example evaluation. SCLP retains full task accuracy while saving 3.28 GB (21.9%) over BF16.
+
+## 14. Perplexity and Speed: Llama-3-8B Variants (2026-05-08)
+
+*Hardware: AMD RX 7900 XTX (gfx1100) · GGML_HIP=ON · ngl=99*
+*PPL: llama-perplexity on WikiText-2, ctx=512 (standard window).*
+*Speed: llama-bench, 512 prompt + 128 generation tokens.*
+
+| Variant | File Size | PPL (WikiText-2) | Prompt (t/s) | Generation (t/s) |
+|---|---|---|---|---|
+| BF16 baseline | 15.00 GB | 10.1443 | 3182.5 | 50.3 |
+| **SCLP compact** | **11.72 GB** | **10.0417** | **2517.0** | **47.1** |
+| Q8_0 | 8.00 GB | 9.9751 | 3393.2 | 82.3 |
+
+**Key findings:**
+
+1. **PPL parity:** SCLP PPL (10.04) is within noise of BF16 (10.14), confirming near-lossless quality at 1.277× compression. Consistent with the Python pipeline result in §8 (10.98 vs 10.99).
+
+2. **Generation speed 94% of BF16:** 47.1 vs 50.3 t/s — the fused decode-GEMV kernel (§10) eliminates virtually all decode overhead for single-token inference. The residual 3.2 t/s gap matches the ~3 t/s gap identified in §10 as inherent nibble-unpack overhead.
+
+3. **Prompt speed slower (79% of BF16):** 2517 vs 3182 t/s — the prefill path still uses the two-pass decode (decode-to-buffer → matrix multiply). No fused prefill kernel exists yet; this is the next optimization target.
+
+4. **Q8 generation advantage:** 82.3 t/s reflects integer arithmetic throughput; Q8 fits the model in less VRAM, reducing memory bandwidth pressure during generation.
