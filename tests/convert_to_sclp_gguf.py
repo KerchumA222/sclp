@@ -1,226 +1,160 @@
+#!/usr/bin/env python3
+"""
+Convert a BF16/F16/F32 GGUF to a compact SCLP GGUF in a single pass.
+
+Linear projection tensors are encoded with SCLP and written at their actual
+compressed size (no zero-padding). All other tensors are copied verbatim.
+
+Usage:
+    python3 tests/convert_to_sclp_gguf.py --input model.bf16.gguf --output model.sclp.gguf
+"""
+import argparse
+import struct
 import sys
 import os
-import struct
 import numpy as np
-import torch
-from transformers import AutoModelForCausalLM, AutoConfig
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import _setup_paths  # noqa: F401
 
-from gguf import GGUFWriter, GGMLQuantizationType
+from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
+from gguf.constants import GGUFValueType
 from compression.encoder import encode_palette
 
-# Layers targeted for SCLP compression (linear projections only)
-SCLP_TARGETS = [
-    'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj',
-    'self_attn.q_proj', 'self_attn.k_proj',
-    'self_attn.v_proj', 'self_attn.o_proj',
+SCLP_TARGET_SUFFIXES = [
+    'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
+    'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight',
+    # MoE stacked expert tensors (Gemma 4, DeepSeek, etc.)
+    'ffn_gate_exps.weight', 'ffn_up_exps.weight', 'ffn_down_exps.weight',
 ]
 
-# HuggingFace → GGUF tensor name mapping for Llama architecture
-HF_TO_GGUF = {
-    'model.embed_tokens.weight':                   'token_embd.weight',
-    'model.norm.weight':                           'output_norm.weight',
-    'lm_head.weight':                              'output.weight',
-}
 
-def hf_layer_to_gguf(name):
-    """Convert HuggingFace layer name to GGUF tensor name."""
-    # model.layers.{i}.self_attn.q_proj.weight → blk.{i}.attn_q.weight
-    attn_map = {
-        'self_attn.q_proj': 'attn_q',
-        'self_attn.k_proj': 'attn_k',
-        'self_attn.v_proj': 'attn_v',
-        'self_attn.o_proj': 'attn_output',
-    }
-    mlp_map = {
-        'mlp.gate_proj': 'ffn_gate',
-        'mlp.up_proj':   'ffn_up',
-        'mlp.down_proj': 'ffn_down',
-    }
-    norm_map = {
-        'input_layernorm':     'attn_norm',
-        'post_attention_layernorm': 'ffn_norm',
-    }
-    import re
-    m = re.match(r'model\.layers\.(\d+)\.(.*?)\.weight$', name)
-    if m:
-        idx, sub = m.group(1), m.group(2)
-        for hf_key, gguf_key in {**attn_map, **mlp_map, **norm_map}.items():
-            if sub == hf_key:
-                return f'blk.{idx}.{gguf_key}.weight'
-    return HF_TO_GGUF.get(name, name)  # fallback: return as-is
+def is_sclp_target(name: str) -> bool:
+    return any(name.endswith(s) for s in SCLP_TARGET_SUFFIXES)
 
 
-def bf16_param_to_uint16(param):
-    """Return BF16 weight bits as a flattened uint16 numpy array."""
-    # Keep as bfloat16, view int16 bits, then cast to uint16 (same bit pattern)
-    return param.detach().bfloat16().view(torch.int16).numpy().view(np.uint16).flatten()
+def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -> np.ndarray:
+    """Return BF16 bit patterns as uint16, converting from any supported input dtype."""
+    raw = tensor_data.flatten()
+    if tensor_type == GGMLQuantizationType.BF16:
+        return raw.view(np.uint16)
+    if tensor_type == GGMLQuantizationType.F16:
+        f32 = raw.view(np.float16).astype(np.float32)
+        return (f32.view(np.uint32) >> 16).astype(np.uint16)
+    if tensor_type == GGMLQuantizationType.F32:
+        return (raw.view(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+    raise ValueError(f"Unsupported source type for SCLP encoding: {tensor_type}")
 
 
-def build_sclp_payload(data_u16):
-    """Encode uint16 BF16 weights as a padded SCLP blob.
-
-    Padded to exactly num_weights*2 bytes so GGUF offset arithmetic (which
-    derives tensor size from shape × type_size) stays correct.
-    """
+def build_sclp_blob(data_u16: np.ndarray) -> bytes:
+    """Encode uint16 BF16 weights into a compact SCLP blob (no zero-padding)."""
     encoded = encode_palette(data_u16)
-    num_weights = len(data_u16)
-    palette = encoded['palette'].astype(np.uint8)
-    packed  = encoded['packed_indices'].astype(np.uint8)
-    sm      = encoded['sm_stream'].astype(np.uint8)
+    num_weights     = len(data_u16)
+    palette         = encoded['palette'].astype(np.uint8)
+    ws              = encoded['ws_stream'].astype(np.uint8)
     sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
     sidecar_values  = encoded['sidecar']['values'].astype(np.uint16)
 
-    header = struct.pack("<IB", num_weights, len(palette))
-    sidecar_hdr = struct.pack("<I", len(sidecar_indices))
     blob = (
-        header
+        struct.pack('<IB', num_weights, len(palette))
         + palette.tobytes()
-        + packed.tobytes()
-        + sm.tobytes()
-        + sidecar_hdr
+        + ws.tobytes()
+        + struct.pack('<I', len(sidecar_indices))
         + sidecar_indices.tobytes()
         + sidecar_values.tobytes()
     )
-    target_size = num_weights * 2
-    assert len(blob) <= target_size, (
-        f"SCLP blob {len(blob)} > BF16 size {target_size} — sidecar too large"
-    )
-    return blob + b'\x00' * (target_size - len(blob))
+    return blob
 
 
-def convert_to_sclp(model_id, output_path):
-    print(f"Loading {model_id}...")
-    config = AutoConfig.from_pretrained(model_id)
-    model  = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    writer = GGUFWriter(output_path, "llama")
-
-    # Required KV metadata for llama.cpp to load the model
-    writer.add_uint32("general.file_type", 1)  # F16 (non-SCLP tensors are F32 here)
-    writer.add_uint32("llama.context_length",       config.max_position_embeddings)
-    writer.add_uint32("llama.embedding_length",     config.hidden_size)
-    writer.add_uint32("llama.block_count",          config.num_hidden_layers)
-    writer.add_uint32("llama.feed_forward_length",  config.intermediate_size)
-    writer.add_uint32("llama.rope.dimension_count",
-                      config.hidden_size // config.num_attention_heads)
-    writer.add_uint32("llama.attention.head_count",    config.num_attention_heads)
-    writer.add_uint32("llama.attention.head_count_kv",
-                      getattr(config, 'num_key_value_heads', config.num_attention_heads))
-    writer.add_float32("llama.attention.layer_norm_rms_epsilon", config.rms_norm_eps)
-    writer.add_uint32("llama.vocab_size", config.vocab_size)
-
-    for hf_name, param in model.named_parameters():
-        gguf_name = hf_layer_to_gguf(hf_name)
-        is_sclp = any(t in hf_name for t in SCLP_TARGETS)
-
-        if is_sclp:
-            print(f"  SCLP  {hf_name} → {gguf_name}")
-            data = bf16_param_to_uint16(param)
-            payload = build_sclp_payload(data)
-
-            np_payload = np.frombuffer(payload, dtype=np.uint8)
-            writer.add_tensor(gguf_name, np_payload,
-                              raw_dtype=GGMLQuantizationType.SCLP,
-                              raw_shape=list(param.shape))
+def copy_kv(writer: GGUFWriter, reader: GGUFReader) -> None:
+    for key, field in reader.fields.items():
+        if key.startswith('GGUF.'):
+            continue
+        if key == 'general.architecture':
+            continue  # GGUFWriter adds this via constructor
+        main_type = field.types[0]
+        if main_type == GGUFValueType.ARRAY:
+            sub_type = field.types[-1]
+            writer.add_key_value(key, field.contents(), main_type, sub_type)
         else:
-            print(f"  BF16  {hf_name} → {gguf_name}")
-            data = bf16_param_to_uint16(param)
-            np_bf16 = data.reshape(param.shape)
-            writer.add_tensor(gguf_name, np_bf16,
-                              raw_dtype=GGMLQuantizationType.BF16,
-                              raw_shape=list(param.shape))
+            writer.add_key_value(key, field.contents(), main_type)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input',  required=True, help='Input BF16/F16 GGUF file')
+    parser.add_argument('--output', default=None,  help='Output compact SCLP GGUF file')
+    args = parser.parse_args()
+
+    if args.output is None:
+        base, ext = os.path.splitext(args.input)
+        args.output = base + '-SCLP' + ext
+
+    print(f"Input:  {args.input}")
+    print(f"Output: {args.output}")
+
+    reader = GGUFReader(args.input, mode='r')
+
+    arch_field = reader.fields.get('general.architecture')
+    arch = arch_field.contents() if arch_field else 'llama'
+
+    writer = GGUFWriter(args.output, arch=arch)
+    copy_kv(writer, reader)
+
+    total_original = 0
+    total_compact   = 0
+    n_compressed    = 0
+    total_sidecar   = 0
+
+    for t in reader.tensors:
+        shape = list(reversed(t.shape.tolist()))  # GGUF stores fastest-dim first
+
+        if is_sclp_target(t.name):
+            data = to_bf16_uint16(t.data, t.tensor_type)
+            blob = build_sclp_blob(data)
+
+            # Pad to even byte count for uint16 view
+            if len(blob) % 2 != 0:
+                blob += b'\x00'
+            np_blob = np.frombuffer(blob, dtype=np.uint16).copy()
+
+            writer.add_tensor(t.name, np_blob,
+                              raw_shape=shape,
+                              raw_dtype=GGMLQuantizationType.SCLP)
+
+            sc_count = struct.unpack_from('<I', blob, 5 + blob[4] + len(data))[0]
+            ratio = t.n_bytes / len(blob)
+            total_original += t.n_bytes
+            total_compact  += len(blob)
+            total_sidecar  += sc_count
+            n_compressed   += 1
+            sc_note = f" ({sc_count} sidecar)" if sc_count else ""
+            print(f"  SCLP [{n_compressed:3d}] {t.name}: {ratio:.3f}x{sc_note}")
+        else:
+            np_data = t.data.copy()
+            writer.add_tensor(t.name, np_data,
+                              raw_shape=shape,
+                              raw_dtype=t.tensor_type)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    print(f"Written: {output_path}")
+
+    if total_original > 0:
+        orig_gb = total_original / (1024**3)
+        comp_gb = total_compact  / (1024**3)
+        total_weights = total_original // 2
+        sc_pct = 100.0 * total_sidecar / total_weights if total_weights else 0
+        print(f"\n{n_compressed} tensors compressed:")
+        print(f"  SCLP data: {orig_gb:.2f} GB → {comp_gb:.2f} GB ({orig_gb - comp_gb:.2f} GB saved, {total_original/total_compact:.3f}x)")
+        print(f"  Sidecar:   {total_sidecar:,} weights ({sc_pct:.4f}%)")
+
+    input_size  = os.path.getsize(args.input)  / (1024**3)
+    output_size = os.path.getsize(args.output) / (1024**3)
+    print(f"File:   {input_size:.2f} GB → {output_size:.2f} GB (saved {input_size - output_size:.2f} GB)")
+    print(f"Written: {args.output}")
 
 
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser(description="Convert a BF16/F16 GGUF to SCLP format.")
-    p.add_argument("--input",  required=True, help="Input BF16/F16 GGUF file")
-    p.add_argument("--output", required=True, help="Output SCLP GGUF file")
-    cli = p.parse_args()
-    input_path  = cli.input
-    output_path = cli.output
-
-    print(f"Reading {input_path}...")
-    reader = GGUFReader(input_path, mode='r')
-
-    targets = [t for t in reader.tensors if is_sclp_target(t.name)]
-    print(f"Found {len(targets)} SCLP targets out of {len(reader.tensors)} tensors.")
-
-    print(f"Copying {input_path} → {output_path}...")
-    shutil.copy2(input_path, output_path)
-
-    total_original_bytes = 0
-    total_payload_bytes = 0
-    total_sidecar = 0
-
-    with open(output_path, 'r+b') as f:
-        for i, tensor in enumerate(targets):
-            data = to_bf16_uint16(tensor.data, tensor.tensor_type)
-            encoded = encode_palette(data)
-
-            num_weights = len(data)
-            palette = encoded['palette'].astype(np.uint8)
-            packed = encoded['packed_indices'].astype(np.uint8)
-            sm = encoded['sm_stream'].astype(np.uint8)
-            sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
-            sidecar_values = encoded['sidecar']['values'].astype(np.uint16)
-            sidecar_count = len(sidecar_indices)
-
-            # Build payload with ACTUAL compressed size (no padding)
-            header = struct.pack("<IB", num_weights, len(palette))
-            sidecar_hdr = struct.pack("<I", sidecar_count)
-            payload = bytearray(
-                header
-                + palette.tobytes()
-                + packed.tobytes()
-                + sm.tobytes()
-                + sidecar_hdr
-                + sidecar_indices.tobytes()
-                + sidecar_values.tobytes()
-            )
-
-            payload_bytes = len(payload)
-
-            if payload_bytes > tensor.n_bytes:
-                raise ValueError(
-                    f"SCLP payload ({payload_bytes} B) exceeds original ({tensor.n_bytes} B)"
-                )
-
-            # Update tensor type to SCLP (42)
-            field = tensor.field
-            type_field_offset = (field.offset
-                         + field.parts[0].nbytes
-                         + field.parts[1].nbytes
-                         + field.parts[2].nbytes
-                         + field.parts[3].nbytes)
-
-            f.seek(type_field_offset)
-            f.write(struct.pack("<I", int(GGMLQuantizationType.SCLP)))
-
-            # Write compressed payload (not padded)
-            f.seek(tensor.data_offset)
-            f.write(payload)
-
-            ratio = tensor.n_bytes / payload_bytes
-            total_original_bytes += tensor.n_bytes
-            total_payload_bytes += payload_bytes
-            total_sidecar += sidecar_count
-            sc_note = f" ({sidecar_count} sidecar)" if sidecar_count else ""
-            print(f"  [{i+1:3d}/{len(targets)}] {tensor.name}: {ratio:.3f}x{sc_note}")
-
-    overall_ratio = total_original_bytes / total_payload_bytes
-    savings_mb = (total_original_bytes - total_payload_bytes) / (1024 ** 2)
-    total_weights = total_original_bytes // 2
-    sidecar_pct = 100.0 * total_sidecar / total_weights if total_weights else 0
-    print(f"\nDone. {len(targets)} tensors compressed.")
-    print(f"Overall ratio: {overall_ratio:.3f}x ({savings_mb:.1f} MiB saved)")
-    print(f"Sidecar entries: {total_sidecar:,} weights ({sidecar_pct:.4f}% of total)")
+if __name__ == '__main__':
+    main()
