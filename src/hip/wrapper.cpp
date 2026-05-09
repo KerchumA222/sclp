@@ -90,9 +90,10 @@ PYBIND11_MODULE(testmodule, m) {
         std::unordered_set<uint8_t> palette_set(h_palette, h_palette + palette_size);
 
         uint32_t packed_size = (num_weights + 1) / 2;
+        uint32_t sm_size     = (num_weights + 1) / 2;  // nibble-packed: ceil(N/2) bytes
 
         py::array_t<uint8_t> packed_out(packed_size);
-        py::array_t<uint8_t> sm_out(num_weights);
+        py::array_t<uint8_t> sm_out(sm_size);
         uint8_t* h_packed = static_cast<uint8_t*>(packed_out.request().ptr);
         uint8_t* h_sm     = static_cast<uint8_t*>(sm_out.request().ptr);
 
@@ -101,15 +102,15 @@ PYBIND11_MODULE(testmodule, m) {
         CHECK_HIP(hipMalloc(&d_input,  num_weights * sizeof(uint16_t)));
         CHECK_HIP(hipMalloc(&d_lookup, 256));
         CHECK_HIP(hipMalloc(&d_packed, packed_size));
-        CHECK_HIP(hipMalloc(&d_sm,     num_weights));
+        CHECK_HIP(hipMalloc(&d_sm,     sm_size));
 
         CHECK_HIP(hipMemcpy(d_input,  h_input,  num_weights * sizeof(uint16_t), hipMemcpyHostToDevice));
         CHECK_HIP(hipMemcpy(d_lookup, h_lookup, 256,                            hipMemcpyHostToDevice));
 
         launch_encode_kernel(d_input, d_lookup, d_packed, d_sm, num_weights);
 
-        CHECK_HIP(hipMemcpy(h_packed, d_packed, packed_size,  hipMemcpyDeviceToHost));
-        CHECK_HIP(hipMemcpy(h_sm,     d_sm,     num_weights,  hipMemcpyDeviceToHost));
+        CHECK_HIP(hipMemcpy(h_packed, d_packed, packed_size, hipMemcpyDeviceToHost));
+        CHECK_HIP(hipMemcpy(h_sm,     d_sm,     sm_size,     hipMemcpyDeviceToHost));
 
         CHECK_HIP(hipFree(d_input));
         CHECK_HIP(hipFree(d_lookup));
@@ -151,35 +152,41 @@ PYBIND11_MODULE(testmodule, m) {
     //    sidecar_indices: uint32[K]        — optional outlier positions
     //    sidecar_values:  uint16[K]        — optional outlier BF16 values
     //    returns: uint16[N]
+    // SM is nibble-packed (ceil(N/2) bytes); num_weights must be provided explicitly
+    // because ceil(N/2) is ambiguous for odd N. Defaults to packed.size*2 (even N).
     m.def("decode", [](py::array_t<uint8_t> packed,
                        py::array_t<uint8_t> sm,
                        py::array_t<uint8_t> palette,
                        py::array_t<uint32_t> sidecar_indices,
-                       py::array_t<uint16_t> sidecar_values) {
-        auto buf_sm = sm.request();
-        uint32_t num_weights = static_cast<uint32_t>(buf_sm.size);
-        const uint8_t* h_sm = static_cast<const uint8_t*>(buf_sm.ptr);
-
+                       py::array_t<uint16_t> sidecar_values,
+                       int num_weights_hint = -1) {
+        auto buf_sm     = sm.request();
         auto buf_packed = packed.request();
-        const uint8_t* h_packed = static_cast<const uint8_t*>(buf_packed.ptr);
+        auto buf_palette= palette.request();
 
-        auto buf_palette = palette.request();
+        uint32_t num_weights = (num_weights_hint > 0)
+            ? static_cast<uint32_t>(num_weights_hint)
+            : static_cast<uint32_t>(buf_packed.size) * 2;
+
+        const uint8_t* h_sm      = static_cast<const uint8_t*>(buf_sm.ptr);
+        const uint8_t* h_packed  = static_cast<const uint8_t*>(buf_packed.ptr);
         const uint8_t* h_palette = static_cast<const uint8_t*>(buf_palette.ptr);
 
         py::array_t<uint16_t> output(num_weights);
         uint16_t* h_output = static_cast<uint16_t*>(output.request().ptr);
 
         uint32_t packed_size = (num_weights + 1) / 2;
+        uint32_t sm_size     = (num_weights + 1) / 2;
         uint8_t  *d_packed, *d_sm, *d_palette;
         uint16_t *d_output;
         CHECK_HIP(hipMalloc(&d_packed,  packed_size));
-        CHECK_HIP(hipMalloc(&d_sm,      num_weights));
+        CHECK_HIP(hipMalloc(&d_sm,      sm_size));
         CHECK_HIP(hipMalloc(&d_palette, buf_palette.size));
         CHECK_HIP(hipMalloc(&d_output,  num_weights * sizeof(uint16_t)));
 
-        CHECK_HIP(hipMemcpy(d_packed,  h_packed,  packed_size,          hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_sm,      h_sm,      num_weights,           hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(d_palette, h_palette, buf_palette.size,      hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_packed,  h_packed,  packed_size,     hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_sm,      h_sm,      sm_size,          hipMemcpyHostToDevice));
+        CHECK_HIP(hipMemcpy(d_palette, h_palette, buf_palette.size, hipMemcpyHostToDevice));
 
         launch_decode_kernel(d_packed, d_sm, d_palette, d_output, num_weights);
 
@@ -206,8 +213,9 @@ PYBIND11_MODULE(testmodule, m) {
     py::arg("packed"),
     py::arg("sm"),
     py::arg("palette"),
-    py::arg("sidecar_indices") = py::array_t<uint32_t>(0),
-    py::arg("sidecar_values")  = py::array_t<uint16_t>(0),
+    py::arg("sidecar_indices")  = py::array_t<uint32_t>(0),
+    py::arg("sidecar_values")   = py::array_t<uint16_t>(0),
+    py::arg("num_weights_hint") = -1,
     "Decode nibble-packed palette indices and SM stream back to BF16 weights, applying sidecar");
 
     m.def("fused_gemm", [](py::array_t<uint16_t> A, py::array_t<uint8_t> packed, py::array_t<uint8_t> sm, py::array_t<uint8_t> palette, int M, int N, int K) {

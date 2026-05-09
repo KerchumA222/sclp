@@ -69,7 +69,7 @@ def test_end_to_end():
         print(f"    Sidecar: {len(sc_indices)} outlier weight(s)")
 
         # 3. Decode back to original clipped values (pass sidecar for exact reconstruction)
-        decoded = testmodule.decode(packed, sm_stream, palette, sc_indices, sc_values)
+        decoded = testmodule.decode(packed, sm_stream, palette, sc_indices, sc_values, len(clipped))
 
         # Verification: decoded == clipped (since no lossy encoding step besides rounding/quantization)
         print("    Checking clip equality...")

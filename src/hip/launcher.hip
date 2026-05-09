@@ -52,6 +52,13 @@ void launch_gemm_cuda(const float* A, const float* B, float* C, int M, int N, in
     printf("  -> Launching gemm stub: %dx%d x %dx%d -> %dx%d\n", M, K, K, N, M, N);
 }
 
+// Stub — fused SCLP GEMM not yet implemented in standalone HIP module.
+// The production path uses sclp_fused_gemm_kernel in sclp_bridge.cuh.
+void launch_fused_gemm(const uint16_t* A, const uint8_t* packed, const uint8_t* sm,
+                       const uint8_t* palette, uint16_t* C, int M, int N, int K) {
+    printf("launch_fused_gemm: not implemented\n");
+}
+
 void launch_clip_kernel(const uint16_t* input, uint16_t* output, unsigned int num_weights, unsigned char threshold, unsigned int seed, uint8_t mantissa_mask) {
     dim3 block(256);
     uint32_t grid_size = (num_weights + 255) / 256;

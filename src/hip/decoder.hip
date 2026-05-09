@@ -15,24 +15,23 @@ __global__ void decode_palette_kernel(
     }
     __syncthreads();
 
-    // Each thread processes a pair of weights (one packed byte)
+    // Each thread processes a pair of weights (one packed byte + one SM byte).
+    // SM byte: smn0(high nibble) | smn1(low nibble), smn = sign(3) | mantissa_top3(2:0)
     uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t base_idx = pair_idx << 1;
-    
+
     if (base_idx >= num_weights) return;
 
-    // 2. Read one byte of packed indices (2 weights)
     uint8_t packed_byte = packed_indices[pair_idx];
+    uint8_t sm_byte     = sm_stream[pair_idx];
     uint8_t exp0 = s_palette[packed_byte >> 4];
     uint8_t exp1 = s_palette[packed_byte & 0x0F];
+    uint8_t smn0 = sm_byte >> 4;
+    uint8_t smn1 = sm_byte & 0x0F;
 
-    // 3. Process first weight
-    uint8_t sm0 = sm_stream[base_idx];
-    output[base_idx] = ((uint16_t)(sm0 >> 7) << 15) | ((uint16_t)exp0 << 7) | (sm0 & 0x7F);
+    // smn = sign(3) | mant_top3(2:0) → BF16: sign(15) | exp(14:7) | mant_top3(6:4) | 0000
+    output[base_idx] = ((uint16_t)(smn0 >> 3) << 15) | ((uint16_t)exp0 << 7) | ((uint16_t)(smn0 & 0x7) << 4);
 
-    // 4. Process second weight if it exists
-    if (base_idx + 1 < num_weights) {
-        uint8_t sm1 = sm_stream[base_idx + 1];
-        output[base_idx + 1] = ((uint16_t)(sm1 >> 7) << 15) | ((uint16_t)exp1 << 7) | (sm1 & 0x7F);
-    }
+    if (base_idx + 1 < num_weights)
+        output[base_idx + 1] = ((uint16_t)(smn1 >> 3) << 15) | ((uint16_t)exp1 << 7) | ((uint16_t)(smn1 & 0x7) << 4);
 }
