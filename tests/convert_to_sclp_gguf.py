@@ -18,14 +18,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import _setup_paths  # noqa: F401
 
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
-from gguf.constants import GGUFValueType
+from gguf.constants import GGUFValueType, GGML_QUANT_SIZES
 from compression.encoder import encode_palette
 
 SCLP_TARGET_SUFFIXES = [
     'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
     'ffn_gate.weight', 'ffn_up.weight', 'ffn_down.weight',
-    # MoE stacked expert tensors (Gemma 4, DeepSeek, etc.)
+    # MoE stacked expert tensors (separate gate/up, e.g. DeepSeek)
     'ffn_gate_exps.weight', 'ffn_up_exps.weight', 'ffn_down_exps.weight',
+    # MoE fused gate+up experts (Gemma 4)
+    'ffn_gate_up_exps.weight',
 ]
 
 
@@ -72,6 +74,8 @@ def copy_kv(writer: GGUFWriter, reader: GGUFReader) -> None:
             continue
         if key == 'general.architecture':
             continue  # GGUFWriter adds this via constructor
+        if key.startswith('split.'):
+            continue  # strip split-shard metadata — output is a single file
         main_type = field.types[0]
         if main_type == GGUFValueType.ARRAY:
             sub_type = field.types[-1]
@@ -82,18 +86,23 @@ def copy_kv(writer: GGUFWriter, reader: GGUFReader) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input',  required=True, help='Input BF16/F16 GGUF file')
+    parser.add_argument('--input',  required=True, nargs='+',
+                        help='Input BF16/F16 GGUF file(s). For split GGUFs, pass all shards in order.')
     parser.add_argument('--output', default=None,  help='Output compact SCLP GGUF file')
     args = parser.parse_args()
 
     if args.output is None:
-        base, ext = os.path.splitext(args.input)
+        base, ext = os.path.splitext(args.input[0])
+        # Strip trailing shard suffix if present (e.g. -00001-of-00002)
+        import re
+        base = re.sub(r'-\d{5}-of-\d{5}$', '', base)
         args.output = base + '-SCLP' + ext
 
     print(f"Input:  {args.input}")
     print(f"Output: {args.output}")
 
-    reader = GGUFReader(args.input, mode='r')
+    readers = [GGUFReader(p, mode='r') for p in args.input]
+    reader  = readers[0]  # KV metadata comes from shard 0
 
     arch_field = reader.fields.get('general.architecture')
     arch = arch_field.contents() if arch_field else 'llama'
@@ -106,7 +115,8 @@ def main():
     n_compressed    = 0
     total_sidecar   = 0
 
-    for t in reader.tensors:
+    all_tensors = [t for r in readers for t in r.tensors]
+    for t in all_tensors:
         shape = list(reversed(t.shape.tolist()))  # GGUF stores fastest-dim first
 
         if is_sclp_target(t.name):
@@ -131,8 +141,15 @@ def main():
             sc_note = f" ({sc_count} sidecar)" if sc_count else ""
             print(f"  SCLP [{n_compressed:3d}] {t.name}: {ratio:.3f}x{sc_note}")
         else:
-            np_data = t.data.copy()
-            writer.add_tensor(t.name, np_data,
+            # GGUFWriter applies quant_shape_from_byte_shape when tensor.dtype==uint8,
+            # which would halve the shape. View as the native element type to avoid that.
+            raw = t.data
+            if raw.dtype == np.uint8:
+                block_size, type_size = GGML_QUANT_SIZES[t.tensor_type]
+                if type_size == 2 and block_size == 1:
+                    raw = raw.view(np.uint16)
+                # Other quantized types (Q4, Q8 etc.) should not appear in a BF16 source GGUF.
+            writer.add_tensor(t.name, raw.copy(),
                               raw_shape=shape,
                               raw_dtype=t.tensor_type)
 
@@ -150,7 +167,7 @@ def main():
         print(f"  SCLP data: {orig_gb:.2f} GB → {comp_gb:.2f} GB ({orig_gb - comp_gb:.2f} GB saved, {total_original/total_compact:.3f}x)")
         print(f"  Sidecar:   {total_sidecar:,} weights ({sc_pct:.4f}%)")
 
-    input_size  = os.path.getsize(args.input)  / (1024**3)
+    input_size  = sum(os.path.getsize(p) for p in args.input) / (1024**3)
     output_size = os.path.getsize(args.output) / (1024**3)
     print(f"File:   {input_size:.2f} GB → {output_size:.2f} GB (saved {input_size - output_size:.2f} GB)")
     print(f"Written: {args.output}")
