@@ -55,15 +55,14 @@ def patch_gguf_with_sclp(input_path, output_path):
 
             num_weights     = len(data)
             palette         = encoded['palette'].astype(np.uint8)
-            packed          = encoded['packed_indices'].astype(np.uint8)
-            sm              = encoded['sm_stream'].astype(np.uint8)
+            ws              = encoded['ws_stream'].astype(np.uint8)
             sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
             sidecar_values  = encoded['sidecar']['values'].astype(np.uint16)
             sidecar_count   = len(sidecar_indices)
 
             # Blob layout:
             #   [uint32 num_weights][uint8 palette_size][palette]
-            #   [packed_indices][sm_stream]
+            #   [ws_stream (N bytes): idx(7:4)|smn(3:0) per weight]
             #   [uint32 sidecar_count][uint32[] indices][uint16[] values]
             #   [zero padding to num_weights*2 bytes]
             header        = struct.pack("<IB", num_weights, len(palette))
@@ -71,8 +70,7 @@ def patch_gguf_with_sclp(input_path, output_path):
             sclp_payload  = bytearray(
                 header
                 + palette.tobytes()
-                + packed.tobytes()
-                + sm.tobytes()
+                + ws.tobytes()
                 + sidecar_hdr
                 + sidecar_indices.tobytes()
                 + sidecar_values.tobytes()

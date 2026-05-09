@@ -27,8 +27,8 @@ def sclp_blob_actual_size(data: np.ndarray) -> int:
     num_w,    = struct.unpack_from('<I', blob, 0)
     pal_size  = blob[4]
     packed_off = 5 + pal_size
-    sm_off    = packed_off + (num_w + 1) // 2
-    sc_off    = sm_off + (num_w + 1) // 2  # SM is nibble-packed: ceil(N/2) bytes
+    ws_off = packed_off       # ws_stream immediately follows palette (N bytes, 1 per weight)
+    sc_off = ws_off + num_w  # sidecar starts after ws_stream
     sc_count, = struct.unpack_from('<I', blob, sc_off)
     idx_off   = sc_off + 4
     val_off   = idx_off + sc_count * 4
