@@ -71,15 +71,16 @@ Rationale: These constitute ~90% of model parameters. Embeddings and LayerNorm a
 
 The Python encoder and HIP encoder now produce the **same wire format**:
 - `packed_indices`: nibble-packed, 2 weights per byte — `(idx_even << 4) | idx_odd`
-- `sm_stream`: one byte per weight — `sign(7) | mantissa(6:0)` — full 7 bits, lossless
-- Compression ratio: 12 bits/weight vs 16 bits original = **1.333×** on the compressed streams
+- `sm_stream`: nibble-packed, 2 weights per byte — `sign(3) | mantissa_top3(2:0)` per nibble, high nibble = even weight
+- Compression ratio: 8 bits/weight vs 16 bits original = **2×** on the compressed streams
+- Top 3 mantissa bits are kept; bits 3:0 are zeroed. This acts as mild regularization and empirically *lowers* PPL vs BF16.
 
 ### Encoded Data Structure (dict returned by `encode_palette` and `testmodule.encode`)
 ```python
 {
   'palette':        np.uint8[<=16],        # exponent values sorted by frequency (descending)
   'packed_indices': np.uint8[ceil(N/2)],   # nibble-packed: high nibble = even weight
-  'sm_stream':      np.uint8[N],           # sign(7) | mantissa(6:0) per weight
+  'sm_stream':      np.uint8[ceil(N/2)],   # nibble-packed: sign(3) | mantissa_top3(2:0), high nibble = even weight
   'num_weights':    int,
   'sidecar': {                             # weights whose exponent is not in the palette
     'indices': np.uint32[K],               # positions in the weight array
@@ -143,7 +144,7 @@ The SCLP payload stored inside a GGUF tensor slot is **not** the same as the sta
 
 ```
 [uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
-[packed_indices (ceil(num_weights/2) bytes)][sm_stream (num_weights bytes)]
+[packed_indices (ceil(num_weights/2) bytes)][sm_stream (ceil(num_weights/2) bytes)]
 [uint32 sidecar_count]
 [uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
 ```
@@ -214,7 +215,7 @@ Use `llama-completion`, not `llama-cli`. `llama-cli` does not support `-no-cnv`.
 `/home/ajkerchum/llama.cpp/ggml/src/ggml-cuda/sclp_bridge.cuh` implements the on-device decode path:
 
 - `sclp_decode_blob_kernel`: Self-parses the GGUF blob header on-device. Thread 0 reads `blob[4]` (palette_size) into `__shared__` memory, then all threads load the palette into `__shared__ uint8_t s_palette[16]`. Derives `packed` and `sm` pointer offsets from palette_size. No host-side device reads, safe during HIP stream capture.
-- `sclp_fixup_sidecar_kernel`: Reads `sidecar_count` from the blob on-device (after sm_stream), then each thread restores one outlier weight via scatter write into the output buffer. Uses a grid-stride loop with 4 fixed blocks so it handles any sidecar count without a D2H read. Threads where `i >= sidecar_count` return after one shared-memory read.
+- `sclp_fixup_sidecar_kernel`: Reads `sidecar_count` from the blob on-device (after sm_stream, at offset `packed + ceil(N/2) + ceil(N/2)`), then each thread restores one outlier weight via scatter write into the output buffer. Uses a grid-stride loop with 4 fixed blocks so it handles any sidecar count without a D2H read. Threads where `i >= sidecar_count` return after one shared-memory read.
 - `llama_sclp_dispatch`: Launches both kernels sequentially on the same HIP stream. Decode grid is proportional to `num_weights`; fixup grid is fixed at 4 blocks.
 
 The dispatch is wired in at the top of `ggml_cuda_mul_mat` in `ggml-cuda.cu`: when `src0->type == GGML_TYPE_SCLP`, the blob is decoded into a pool-allocated `uint16_t` buffer, `src0_bf16` is constructed as a copy of `src0` with `type = GGML_TYPE_BF16` and `data = decoded.get()`, and the function recurses. Because `GGML_TYPE_SCLP` has `type_size=2` (same as BF16), all strides in `nb[]` are already correct for BF16 — no adjustment needed.
