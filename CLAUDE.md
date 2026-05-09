@@ -52,8 +52,8 @@ python3 tests/test_hip_module.py
 | File | Role |
 |---|---|
 | `clipping.py` | `soft_exponent_clip()` — stochastic exponent clipping on BF16 uint16 arrays |
-| `encoder.py` | `encode_palette()` — builds exponent palette + 4-bit indices + SM stream |
-| `decoder.py` | `decode_palette()` — reconstructs BF16 weights from palette + SM stream |
+| `encoder.py` | `encode_palette()` — builds exponent palette + interleaved ws_stream |
+| `decoder.py` | `decode_palette()` — reconstructs BF16 weights from palette + ws_stream |
 | `storage.py` | `CompressedTensorStorage` — binary `.sclp` file format (magic `SCLP`) |
 | `pipeline.py` | `SCLPCompressor` — high-level compress/decompress/save/load API |
 
@@ -70,34 +70,35 @@ Rationale: These constitute ~90% of model parameters. Embeddings and LayerNorm a
 - Bits 6-0: mantissa (7 bits)
 
 The Python encoder and HIP encoder now produce the **same wire format**:
-- `packed_indices`: nibble-packed, 2 weights per byte — `(idx_even << 4) | idx_odd`
-- `sm_stream`: nibble-packed, 2 weights per byte — `sign(3) | mantissa_top3(2:0)` per nibble, high nibble = even weight
-- Compression ratio: 8 bits/weight vs 16 bits original = **2×** on the compressed streams
+- `ws_stream`: one byte per weight — `palette_idx(7:4) | smn(3:0)`
+  - `palette_idx`: 4-bit index into the exponent palette
+  - `smn`: `sign(3) | mantissa_top3(2:0)` — top 3 of 7 mantissa bits
+- Compression ratio: 8 bits/weight vs 16 bits original = **2×**
 - Top 3 mantissa bits are kept; bits 3:0 are zeroed. This acts as mild regularization and empirically *lowers* PPL vs BF16.
+- Both palette index and SM for each weight are co-located in a single byte, halving L2 cache pressure vs separate packed+SM arrays.
 
-### Encoded Data Structure (dict returned by `encode_palette` and `testmodule.encode`)
+### Encoded Data Structure (dict returned by `encode_palette`)
 ```python
 {
-  'palette':        np.uint8[<=16],        # exponent values sorted by frequency (descending)
-  'packed_indices': np.uint8[ceil(N/2)],   # nibble-packed: high nibble = even weight
-  'sm_stream':      np.uint8[ceil(N/2)],   # nibble-packed: sign(3) | mantissa_top3(2:0), high nibble = even weight
-  'num_weights':    int,
-  'sidecar': {                             # weights whose exponent is not in the palette
-    'indices': np.uint32[K],               # positions in the weight array
-    'values':  np.uint16[K],              # full BF16 bits stored verbatim
+  'palette':   np.uint8[<=16],   # exponent values sorted by frequency (descending)
+  'ws_stream': np.uint8[N],      # one byte per weight: palette_idx(7:4) | smn(3:0)
+  'num_weights': int,
+  'sidecar': {                   # weights whose exponent is not in the palette
+    'indices': np.uint32[K],     # positions in the weight array
+    'values':  np.uint16[K],     # full BF16 bits stored verbatim
   }
 }
 ```
 
-`testmodule.encode` returns the same fields with keys `packed`, `sm`, `sidecar_indices`, `sidecar_values`.
+`testmodule.encode` returns `packed`, `sm`, `sidecar_indices`, `sidecar_values` (HIP module uses the older separate-stream layout internally; the GGUF bridge uses ws_stream).
 
 ### HIP GPU Implementation (`src/hip/`)
 
 | File | Status |
 |---|---|
 | `clipping.hip` | Complete — `soft_exponent_clip_kernel` |
-| `encoder.hip` | Complete — `encode_palette_kernel` (nibble-packed indices + SM stream) |
-| `decoder.hip` | Complete — `decode_palette_kernel` (reconstructs BF16 from palette + SM) |
+| `encoder.hip` | Complete — `encode_palette_kernel` (interleaved ws_stream: idx(7:4)\|smn(3:0)) |
+| `decoder.hip` | Complete — `decode_palette_kernel` (reconstructs BF16 from palette + ws_stream) |
 | `launcher.hip` | C-interface launchers exported via `extern "C"` |
 | `wrapper.cpp` | pybind11 bindings — exposes `clip`, `encode`, `decode` |
 | `CMakeLists.txt` | Builds `hip_kernels` static lib + `testmodule` shared lib; strips LTO flags |
@@ -107,8 +108,8 @@ The compiled Python module (`testmodule`) lives in `python_pkg/` and is imported
 ### Kernel Launcher Signatures
 ```cpp
 launch_clip_kernel(const uint16_t* input, uint16_t* output, uint n, uint8_t threshold, uint32_t seed, uint8_t mantissa_mask);
-launch_encode_kernel(const uint16_t* input, const uint8_t* lookup, uint8_t* packed, uint8_t* sm, uint32_t n);
-launch_decode_kernel(const uint8_t* packed, const uint8_t* sm, const uint8_t* palette, uint16_t* output, uint32_t n);
+launch_encode_kernel(const uint16_t* input, const uint8_t* lookup, uint8_t* ws, uint32_t n);
+launch_decode_kernel(const uint8_t* ws, const uint8_t* palette, uint16_t* output, uint32_t n);
 ```
 
 ### File Format (`.sclp`) — VERSION 2
@@ -119,12 +120,13 @@ VERSION 1 files (no sidecar) load correctly with an empty sidecar.
 ## Key Implementation Notes
 
 - All weights are passed as `np.uint16` representing raw BF16 bit patterns, never as floats
-- Python and HIP encoders produce identical wire format; Python decoder is fully vectorised (no Python loop)
+- Python decoder is fully vectorised (no Python loop); encoder produces `ws_stream` in a single NumPy operation
 - Clipping: exponents `> threshold+1` are hard-clipped to `threshold`; exponents `== threshold+1` survive with 50% probability (flat, matches HIP XorshiftPRNG)
-- Sidecar: weights with exponents outside the top-16 palette are stored verbatim; decoder restores them exactly. Without sidecar, rare low-exponent weights would be inflated to the nearest palette exponent — catastrophic for quality.
-- `testmodule.encode(input, palette)` accepts the palette array (≤16 uint8 exponent values); the wrapper builds the nearest-neighbour lookup internally
-- `testmodule.decode(packed, sm, palette, sidecar_indices=[], sidecar_values=[])` — sidecar args are optional
+- Sidecar: weights with exponents outside the top-16 palette are stored verbatim; decoder restores them exactly. Without sidecar, rare low-exponent weights would be mapped to the nearest palette exponent — catastrophic for quality.
+- `testmodule.encode(input, palette)` accepts the palette array (≤16 uint8 exponent values); the wrapper builds the nearest-neighbour lookup internally. Returns `packed`, `sm`, `sidecar_indices`, `sidecar_values` (HIP module uses separate streams internally).
+- `testmodule.decode(packed, sm, palette, sidecar_indices=[], sidecar_values=[], num_weights_hint=-1)` — sidecar and num_weights args are optional; num_weights_hint is required for odd N.
 - The `mantissa_mask` parameter of `clip` is applied as `output = weight & (0xFF80 | mantissa_mask)`; pass `0x7F` to preserve all mantissa bits
+- The GEMV kernel omits sidecar correction intentionally — a block-scoped scan caused a 37% throughput regression. The ~0.01% of sidecar weights introduce negligible error for single-token generation.
 
 ## llama.cpp Integration
 
@@ -144,18 +146,20 @@ The SCLP payload stored inside a GGUF tensor slot is **not** the same as the sta
 
 ```
 [uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
-[packed_indices (ceil(num_weights/2) bytes)][sm_stream (ceil(num_weights/2) bytes)]
+[ws_stream (num_weights bytes): palette_idx(7:4)|smn(3:0) per weight]
 [uint32 sidecar_count]
 [uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
 ```
+
+`ws_stream` is exactly `num_weights` bytes — both the palette index and SM nibble for each weight are co-located in a single byte. The sidecar base is always at `ws + num_weights`.
 
 Weights whose exponents fall outside the top-16 palette are stored verbatim in the sidecar section and restored exactly by `sclp_fixup_sidecar_kernel` after the main decode. The sidecar is typically 0.01–0.03% of all weights (lossless).
 
 **Two on-disk variants exist:**
 
-- **Padded** (generated by `convert_to_sclp_gguf.py`): blob is zero-padded to exactly `num_weights * 2` bytes. All GGUF tensor offsets and strides are identical to BF16 — the simplest format, but wastes the ~25% gap between actual compressed size and the BF16-equivalent allocation.
+- **Padded** (generated by `patch_gguf_sclp.py`): blob is zero-padded to exactly `num_weights * 2` bytes. All GGUF tensor offsets and strides are identical to BF16 — the simplest format, but wastes half the allocation since actual compressed content is `~num_weights` bytes.
 
-- **Compact** (generated by `repack_sclp_gguf.py`): each blob is stored at its actual compressed size (no trailing zeros), padded only to GGUF alignment (32 bytes). Each tensor's on-disk size is inferred at load time from consecutive GGUF tensor offsets. Saves ~3.25 GB for Llama-3-8B (14.97 GB → 11.72 GB).
+- **Compact** (generated by `repack_sclp_gguf.py`): each blob is stored at its actual compressed size (no trailing zeros), padded only to GGUF alignment (32 bytes). Each tensor's on-disk size is inferred at load time from consecutive GGUF tensor offsets. For Llama-3-8B: 14.97 GB → 8.47 GB (saves 6.5 GB, ~43% reduction).
 
 The loader handles both transparently via `disk_size` (see below).
 
@@ -190,17 +194,17 @@ To strip the zero-padding from an existing padded SCLP GGUF:
 ```bash
 source eval_env/bin/activate
 python3 tests/repack_sclp_gguf.py \
-    --input  models/llama3/Llama-3-8B-SCLP-Patched.gguf \
-    --output models/llama3/Llama-3-8B-SCLP-Compact.gguf
+    --input  models/llama3/Llama-3-8B-SCLPws-Patched.gguf \
+    --output models/llama3/Llama-3-8B-SCLPws-Compact.gguf
 ```
 
-Each SCLP tensor blob is parsed to find its actual end offset (after sidecar values), then written at that exact size. Non-SCLP tensors are copied verbatim. For Llama-3-8B: 14.97 GB → 11.72 GB (saves 3.25 GB, ~22% reduction).
+Each SCLP tensor blob is parsed to find its actual end offset (after sidecar values), then written at that exact size. Non-SCLP tensors are copied verbatim. For Llama-3-8B: 14.97 GB → 8.47 GB (saves 6.5 GB, ~43% reduction).
 
 ### Running Inference
 
 ```bash
 /home/ajkerchum/llama.cpp/build/bin/llama-completion \
-    -m /home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLP-Patched.gguf \
+    -m /home/ajkerchum/poc/models/llama3/Llama-3-8B-SCLPws-Compact.gguf \
     -ngl 99 \
     -n 100 \
     -no-cnv \
@@ -208,15 +212,25 @@ Each SCLP tensor blob is parsed to find its actual end offset (after sidecar val
     -p "The capital of France is"
 ```
 
-Use `llama-completion`, not `llama-cli`. `llama-cli` does not support `-no-cnv`. Both binaries auto-enable conversation mode when the GGUF contains an embedded chat template (Llama 3 does) — `-no-cnv` forces raw completion. `--repeat-penalty 1.3` prevents repetition loops common in base model completion. Verified working on RX 7900 XTX (gfx1100) at ~16 t/s compressed / ~52 t/s FP16 baseline. The 3x gap is transcoder bridge overhead (extra decode + memory pass per matmul); eliminated by the fused decode-GEMM path.
+Use `llama-completion`, not `llama-cli`. `llama-cli` does not support `-no-cnv`. Both binaries auto-enable conversation mode when the GGUF contains an embedded chat template (Llama 3 does) — `-no-cnv` forces raw completion. `--repeat-penalty 1.3` prevents repetition loops common in base model completion. Verified working on RX 7900 XTX (gfx1100). Current benchmark results (Llama-3-8B, compact GGUF):
+
+| Model | Size | tg128 | pp512 | PPL (wikitext-2) |
+|---|---|---|---|---|
+| BF16 (fp16 GGUF) | 14.97 GB | ~52 t/s | ~12,000 t/s | 10.59 |
+| Q8_0 | 7.95 GB | ~52 t/s | ~3,430 t/s | 10.41 |
+| **SCLP (ws format)** | **8.47 GB** | **~66 t/s** | **~2,730 t/s** | **9.87** |
+
+tg wins because SCLP reads 8 bits/weight vs 16 for BF16. pp lags Q8_0 because the two-pass decode (decode blob → BF16 → rocBLAS GEMM) adds a full weight-matrix read before the GEMM; Q8_0 goes directly through rocBLAS INT8.
 
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
 `/home/ajkerchum/llama.cpp/ggml/src/ggml-cuda/sclp_bridge.cuh` implements the on-device decode path:
 
-- `sclp_decode_blob_kernel`: Self-parses the GGUF blob header on-device. Thread 0 reads `blob[4]` (palette_size) into `__shared__` memory, then all threads load the palette into `__shared__ uint8_t s_palette[16]`. Derives `packed` and `sm` pointer offsets from palette_size. No host-side device reads, safe during HIP stream capture.
-- `sclp_fixup_sidecar_kernel`: Reads `sidecar_count` from the blob on-device (after sm_stream, at offset `packed + ceil(N/2) + ceil(N/2)`), then each thread restores one outlier weight via scatter write into the output buffer. Uses a grid-stride loop with 4 fixed blocks so it handles any sidecar count without a D2H read. Threads where `i >= sidecar_count` return after one shared-memory read.
-- `llama_sclp_dispatch`: Launches both kernels sequentially on the same HIP stream. Decode grid is proportional to `num_weights`; fixup grid is fixed at 4 blocks.
+- `sclp_decode_blob_kernel`: Self-parses the GGUF blob header on-device. Thread 0 reads `blob[4]` (palette_size) into `__shared__` memory, then all threads load the palette into `__shared__ uint8_t s_palette[16]`. `ws = blob + 5 + palette_size`. Each thread processes 8 weights via a single `uint64_t` load from `ws`. No host-side device reads, safe during HIP stream capture.
+- `sclp_fixup_sidecar_kernel`: Reads `sidecar_count` from `ws + num_weights` on-device, then each thread restores one outlier weight via scatter write into the output buffer. Uses a grid-stride loop with 4 fixed blocks so it handles any sidecar count without a D2H read.
+- `sclp_fused_gemv_kernel`: Fused decode+GEMV for M=1 (token generation). Reads ws bytes directly, decodes on-the-fly with a `uint64_t` load per 8 weights. Accepts F32 activations — no separate conversion kernel. 1024 threads/block (32 warps), 1 warp per output row.
+- `sclp_fused_gemm_kernel`: Fused decode+GEMM for small M (prefill up to `2×GEMM_TILE_M=32`). Template parameter `TILE_M=16` keeps all accumulators in VGPRs.
+- `llama_sclp_dispatch`: Launches decode+fixup kernels for the two-pass path (large M prefill, feeds rocBLAS). Decode grid: `ceil(num_weights/8)` groups of 256 threads.
 
 The dispatch is wired in at the top of `ggml_cuda_mul_mat` in `ggml-cuda.cu`: when `src0->type == GGML_TYPE_SCLP`, the blob is decoded into a pool-allocated `uint16_t` buffer, `src0_bf16` is constructed as a copy of `src0` with `type = GGML_TYPE_BF16` and `data = decoded.get()`, and the function recurses. Because `GGML_TYPE_SCLP` has `type_size=2` (same as BF16), all strides in `nb[]` are already correct for BF16 — no adjustment needed.
 
