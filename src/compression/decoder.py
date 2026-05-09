@@ -7,7 +7,7 @@ def decode_palette(encoded_data: dict, num_weights: int) -> np.ndarray:
 
     Expects the format produced by encode_palette():
       packed_indices: uint8[ceil(N/2)] — nibble-packed, high nibble = even weight
-      sm_stream:      uint8[N]         — sign(7) | mantissa(6:0) per weight
+      sm_stream:      uint8[ceil(N/2)] — nibble per weight: sign(3) | mantissa_top3(2:0), nibble-packed
       palette:        uint8[<=16]      — exponent values
       sidecar:        optional dict    — {indices uint32[], values uint16[]}
     """
@@ -24,10 +24,13 @@ def decode_palette(encoded_data: dict, num_weights: int) -> np.ndarray:
     # Look up exponents from palette
     exponents = palette[np.clip(nibbles, 0, len(palette) - 1)].astype(np.uint16)
 
-    # Unpack sign and full 7-bit mantissa from SM stream
-    sm       = sm_stream[:num_weights].astype(np.uint16)
-    sign     = (sm >> 7) & 0x1
-    mantissa = sm & 0x7F
+    # Unpack sign and top-3-bit mantissa from nibble-packed SM stream
+    sm_pos       = np.arange(num_weights)
+    sm_is_odd    = (sm_pos % 2).astype(bool)
+    sm_pb        = sm_stream[sm_pos // 2].astype(np.uint8)
+    sm_nibbles   = np.where(sm_is_odd, sm_pb & 0x0F, sm_pb >> 4).astype(np.uint16)
+    sign         = (sm_nibbles >> 3) & 0x1
+    mantissa     = (sm_nibbles & 0x7) << 4  # restore to bits 6:4, zeros at 3:0
 
     # Reconstruct BF16 bit pattern: sign(15) | exponent(14:7) | mantissa(6:0)
     weights = ((sign << 15) | (exponents << 7) | mantissa).astype(np.uint16)

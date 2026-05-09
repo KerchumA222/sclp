@@ -28,7 +28,7 @@ def sclp_blob_actual_size(data: np.ndarray) -> int:
     pal_size  = blob[4]
     packed_off = 5 + pal_size
     sm_off    = packed_off + (num_w + 1) // 2
-    sc_off    = sm_off + num_w
+    sc_off    = sm_off + (num_w + 1) // 2  # SM is nibble-packed: ceil(N/2) bytes
     sc_count, = struct.unpack_from('<I', blob, sc_off)
     idx_off   = sc_off + 4
     val_off   = idx_off + sc_count * 4
