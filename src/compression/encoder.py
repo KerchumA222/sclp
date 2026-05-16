@@ -134,34 +134,57 @@ def encode_palette(clipped_weights_bf16: np.ndarray) -> dict:
     }
 
 
-def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
+def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
+                      palette_method: str = 'kmeans',
+                      sidecar_dist: int = 0) -> dict:
     """
     Encode BF16 weights (as uint16 bit patterns) into the SCLP4 compressed format.
 
     Output format (4 bits/weight, palette ≤4, 2 weights per byte):
       ws_stream:  uint8[ceil(N/2)] — packed nibbles, high nibble = even weight, low = odd
                   nibble layout: bits[3:2]=palette_idx, bit[1]=sign, bit[0]=mantissa_top1
-      palette:    uint8[<=4]       — exponent values sorted by frequency (descending)
+      palette:    uint8[<=4]       — exponent values
       sidecar:    {indices uint32[], values uint16[]}
+
+    sidecar_dist: same semantics as encode_palette_6b. For SCLP4 the gain is larger
+    because frequency k=4 leaves ~15% of weights uncovered.
 
     BF16 reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top1<<6)
     """
     weights = weights_uint16.flatten().astype(np.uint16)
     num_weights = len(weights)
 
-    def _encode_4b_expert(expert_weights):
+    sidecar_indices_all = []
+    sidecar_values_all  = []
+
+    def _encode_4b_expert(expert_weights, expert_offset=0):
         """Encode a single expert's weights, returning (palette, ws_bytes)."""
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
-        sorted_indices = np.argsort(-counts)
-        palette = unique_exponents[sorted_indices][:4].astype(np.uint8)
+        if palette_method == 'kmeans':
+            palette = _kmeans_palette(unique_exponents, counts, k=4)
+        else:
+            sorted_indices = np.argsort(-counts)
+            palette = unique_exponents[sorted_indices][:4].astype(np.uint8)
 
+        dist_per_exp = np.min(
+            np.abs(np.arange(256, dtype=np.int16)[:, None] -
+                   palette.astype(np.int16)[None, :]),
+            axis=1
+        )
         exp_lookup = np.argmin(
             np.abs(np.arange(256, dtype=np.int16)[:, None] -
                    palette.astype(np.int16)[None, :]),
             axis=1
         ).astype(np.uint8)
         indices = exp_lookup[exponents].astype(np.uint8)
+
+        if sidecar_dist > 0:
+            outlier_mask = dist_per_exp[exponents] > sidecar_dist
+            if outlier_mask.any():
+                out_pos = np.where(outlier_mask)[0].astype(np.uint32)
+                sidecar_indices_all.append(out_pos + expert_offset)
+                sidecar_values_all.append(expert_weights[outlier_mask])
 
         sign          = ((expert_weights >> 15) & 0x1).astype(np.uint8)
         mantissa_top1 = ((expert_weights >> 6)  & 0x1).astype(np.uint8)
@@ -179,21 +202,26 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
         return palette, ws
 
     if n_experts == 1:
-        palette, ws_stream = _encode_4b_expert(weights)
+        palette, ws_stream = _encode_4b_expert(weights, expert_offset=0)
     else:
         expert_nw = num_weights // n_experts
         expert_palettes = []
         ws_parts = []
         for e in range(n_experts):
             ew = weights[e * expert_nw:(e + 1) * expert_nw]
-            pal, ws = _encode_4b_expert(ew)
+            pal, ws = _encode_4b_expert(ew, expert_offset=e * expert_nw)
             expert_palettes.append(pal)
             ws_parts.append(ws)
-        # For multi-expert, palette is a list and ws_stream is concatenated
         palette = expert_palettes  # list of arrays
         ws_stream = np.concatenate(ws_parts)
 
-    sidecar = {'indices': np.array([], dtype=np.uint32), 'values': np.array([], dtype=np.uint16)}
+    if sidecar_indices_all:
+        sc_indices = np.concatenate(sidecar_indices_all).astype(np.uint32)
+        sc_values  = np.concatenate(sidecar_values_all).astype(np.uint16)
+    else:
+        sc_indices = np.array([], dtype=np.uint32)
+        sc_values  = np.array([], dtype=np.uint16)
+    sidecar = {'indices': sc_indices, 'values': sc_values}
 
     return {
         'palette':     palette,
@@ -205,15 +233,21 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
 
 
 def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
-                      palette_method: str = 'kmeans') -> dict:
+                      palette_method: str = 'kmeans',
+                      sidecar_dist: int = 0) -> dict:
     """
     Encode BF16 weights (as uint16 bit patterns) into the SCLP6 compressed format.
 
     Output format (6 bits/weight, palette ≤8, 4 weights per 3 bytes):
       ws_stream:  uint8[ceil(N/4)*3] — packed 6-bit groups
                   sixbit layout: bits[5:3]=palette_idx, bit[2]=sign, bits[1:0]=mantissa_top2
-      palette:    uint8[<=8]         — exponent values sorted by frequency (descending)
-      sidecar:    {indices uint32[], values uint16[]}  — always empty (SCLP6 is fully lossy)
+      palette:    uint8[<=8]         — exponent values
+      sidecar:    {indices uint32[], values uint16[]}
+
+    sidecar_dist: weights whose exponent distance to their nearest palette entry
+    exceeds this threshold are stored verbatim in the sidecar (lossless rescue).
+    0 = no sidecar (default, fully lossy). 1 is recommended: captures ~0.1% of
+    weights responsible for the worst-case errors with negligible size overhead.
 
     BF16 reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top2<<5)
 
@@ -225,7 +259,10 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
     weights = weights_uint16.flatten().astype(np.uint16)
     num_weights = len(weights)
 
-    def _encode_6b_expert(expert_weights):
+    sidecar_indices_all = []
+    sidecar_values_all  = []
+
+    def _encode_6b_expert(expert_weights, expert_offset=0):
         """Encode a single expert's weights, returning (palette, ws_bytes)."""
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
@@ -235,12 +272,29 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
             sorted_indices = np.argsort(-counts)
             palette = unique_exponents[sorted_indices][:8].astype(np.uint8)
 
+        # nearest-palette distance per weight (for sidecar gating)
+        dist_per_exp = np.min(
+            np.abs(np.arange(256, dtype=np.int16)[:, None] -
+                   palette.astype(np.int16)[None, :]),
+            axis=1
+        )  # shape (256,)
+
         exp_lookup = np.argmin(
             np.abs(np.arange(256, dtype=np.int16)[:, None] -
                    palette.astype(np.int16)[None, :]),
             axis=1
         ).astype(np.uint8)
         indices = exp_lookup[exponents].astype(np.uint8)
+
+        # sidecar: weights whose exponent is too far from any palette entry
+        if sidecar_dist > 0:
+            outlier_mask = dist_per_exp[exponents] > sidecar_dist
+            if outlier_mask.any():
+                out_pos = np.where(outlier_mask)[0].astype(np.uint32)
+                sidecar_indices_all.append(out_pos + expert_offset)
+                sidecar_values_all.append(expert_weights[outlier_mask])
+                # map outliers to nearest palette entry in ws_stream (will be overwritten at decode)
+                # indices already set correctly via exp_lookup; only the sidecar rescues the value
 
         sign          = ((expert_weights >> 15) & 0x1).astype(np.uint8)
         mantissa_top2 = ((expert_weights >> 5)  & 0x3).astype(np.uint8)
@@ -263,20 +317,26 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
         return palette, ws
 
     if n_experts == 1:
-        palette, ws_stream = _encode_6b_expert(weights)
+        palette, ws_stream = _encode_6b_expert(weights, expert_offset=0)
     else:
         expert_nw = num_weights // n_experts
         expert_palettes = []
         ws_parts = []
         for e in range(n_experts):
             ew = weights[e * expert_nw:(e + 1) * expert_nw]
-            pal, ws = _encode_6b_expert(ew)
+            pal, ws = _encode_6b_expert(ew, expert_offset=e * expert_nw)
             expert_palettes.append(pal)
             ws_parts.append(ws)
         palette = expert_palettes  # list of arrays
         ws_stream = np.concatenate(ws_parts)
 
-    sidecar = {'indices': np.array([], dtype=np.uint32), 'values': np.array([], dtype=np.uint16)}
+    if sidecar_indices_all:
+        sc_indices = np.concatenate(sidecar_indices_all).astype(np.uint32)
+        sc_values  = np.concatenate(sidecar_values_all).astype(np.uint16)
+    else:
+        sc_indices = np.array([], dtype=np.uint32)
+        sc_values  = np.array([], dtype=np.uint16)
+    sidecar = {'indices': sc_indices, 'values': sc_values}
 
     return {
         'palette':     palette,

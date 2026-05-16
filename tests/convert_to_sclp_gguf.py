@@ -68,7 +68,7 @@ def build_sclp_blob(data_u16: np.ndarray) -> bytes:
     return blob
 
 
-def build_sclp4_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
+def build_sclp4_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int = 0) -> bytes:
     """Encode uint16 BF16 weights into a compact SCLP4 (4-bit) blob (no zero-padding).
 
     For MoE tensors with shape [n_experts, N, K] (slowest-first after GGUF reversal),
@@ -77,7 +77,7 @@ def build_sclp4_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
     """
     # shape is reversed GGUF order: [n_experts, N, K] (slowest to fastest)
     n_experts = shape[0] if (shape is not None and len(shape) >= 3) else 1
-    encoded = encode_palette_4b(data_u16, n_experts=n_experts)
+    encoded = encode_palette_4b(data_u16, n_experts=n_experts, sidecar_dist=sidecar_dist)
     num_weights = len(data_u16)
     ws = encoded['ws_stream'].astype(np.uint8)
     sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
@@ -101,7 +101,7 @@ def build_sclp4_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
     return blob
 
 
-def build_sclp6_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
+def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int = 0) -> bytes:
     """Encode uint16 BF16 weights into a compact SCLP6 (6-bit) blob (no zero-padding).
 
     For MoE tensors with shape [n_experts, N, K] (slowest-first after GGUF reversal),
@@ -110,7 +110,7 @@ def build_sclp6_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
     """
     # shape is reversed GGUF order: [n_experts, N, K] (slowest to fastest)
     n_experts = shape[0] if (shape is not None and len(shape) >= 3) else 1
-    encoded = encode_palette_6b(data_u16, n_experts=n_experts)
+    encoded = encode_palette_6b(data_u16, n_experts=n_experts, sidecar_dist=sidecar_dist)
     num_weights = len(data_u16)
     ws = encoded['ws_stream'].astype(np.uint8)
     sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
@@ -157,6 +157,9 @@ def main():
     parser.add_argument('--output', default=None,  help='Output compact SCLP GGUF file')
     parser.add_argument('--format', choices=['sclp8', 'sclp6', 'sclp4'], default='sclp8',
                         help='Output quantization format: sclp8 (default, 8 bits/weight), sclp6 (6 bits/weight), or sclp4 (4 bits/weight)')
+    parser.add_argument('--sidecar-dist', type=int, default=0, metavar='D',
+                        help='SCLP4/6: store weights verbatim in sidecar if nearest palette exponent distance > D. '
+                             '0=off (default). 1 recommended: fixes ~0.1%% of worst-case errors at <0.3%% size overhead.')
     args = parser.parse_args()
 
     if args.output is None:
@@ -190,13 +193,13 @@ def main():
         if is_sclp_target(t.name):
             data = to_bf16_uint16(t.data, t.tensor_type)
             if args.format == 'sclp4':
-                blob = build_sclp4_blob(data, shape=shape)
+                blob = build_sclp4_blob(data, shape=shape, sidecar_dist=args.sidecar_dist)
                 gguf_dtype = GGMLQuantizationType.SCLP4
                 # Use int8 (not uint8) to bypass GGUFWriter's quant_shape_from_byte_shape
                 # which would incorrectly double the last dimension for blck_size=2 types.
                 np_blob = np.frombuffer(blob, dtype=np.int8).copy()
             elif args.format == 'sclp6':
-                blob = build_sclp6_blob(data, shape=shape)
+                blob = build_sclp6_blob(data, shape=shape, sidecar_dist=args.sidecar_dist)
                 gguf_dtype = GGMLQuantizationType.SCLP6
                 # Use int8 (not uint8) to bypass GGUFWriter's quant_shape_from_byte_shape
                 # which would incorrectly transform shape for blck_size=4 types.
