@@ -19,7 +19,7 @@ import _setup_paths  # noqa: F401
 
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 from gguf.constants import GGUFValueType, GGML_QUANT_SIZES
-from compression.encoder import encode_palette
+from compression.encoder import encode_palette, encode_palette_4b, encode_palette_6b
 
 SCLP_TARGET_SUFFIXES = [
     'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
@@ -49,7 +49,7 @@ def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -
 
 
 def build_sclp_blob(data_u16: np.ndarray) -> bytes:
-    """Encode uint16 BF16 weights into a compact SCLP blob (no zero-padding)."""
+    """Encode uint16 BF16 weights into a compact SCLP (8-bit) blob (no zero-padding)."""
     encoded = encode_palette(data_u16)
     num_weights     = len(data_u16)
     palette         = encoded['palette'].astype(np.uint8)
@@ -60,6 +60,72 @@ def build_sclp_blob(data_u16: np.ndarray) -> bytes:
     blob = (
         struct.pack('<IB', num_weights, len(palette))
         + palette.tobytes()
+        + ws.tobytes()
+        + struct.pack('<I', len(sidecar_indices))
+        + sidecar_indices.tobytes()
+        + sidecar_values.tobytes()
+    )
+    return blob
+
+
+def build_sclp4_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
+    """Encode uint16 BF16 weights into a compact SCLP4 (4-bit) blob (no zero-padding).
+
+    For MoE tensors with shape [n_experts, N, K] (slowest-first after GGUF reversal),
+    each expert gets its own palette.
+    New header: [uint32 num_weights][uint32 n_experts][per-expert: uint8 palette_size, palette]
+    """
+    # shape is reversed GGUF order: [n_experts, N, K] (slowest to fastest)
+    n_experts = shape[0] if (shape is not None and len(shape) >= 3) else 1
+    encoded = encode_palette_4b(data_u16, n_experts=n_experts)
+    num_weights = len(data_u16)
+    ws = encoded['ws_stream'].astype(np.uint8)
+    sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
+    sidecar_values  = encoded['sidecar']['values'].astype(np.uint16)
+
+    # Build per-expert palette header section
+    palettes = encoded['palette'] if n_experts > 1 else [encoded['palette']]
+    palette_header = b''
+    for pal in palettes:
+        pal = pal.astype(np.uint8)
+        palette_header += bytes([len(pal)]) + pal.tobytes()
+
+    blob = (
+        struct.pack('<II', num_weights, n_experts)
+        + palette_header
+        + ws.tobytes()
+        + struct.pack('<I', len(sidecar_indices))
+        + sidecar_indices.tobytes()
+        + sidecar_values.tobytes()
+    )
+    return blob
+
+
+def build_sclp6_blob(data_u16: np.ndarray, shape: list = None) -> bytes:
+    """Encode uint16 BF16 weights into a compact SCLP6 (6-bit) blob (no zero-padding).
+
+    For MoE tensors with shape [n_experts, N, K] (slowest-first after GGUF reversal),
+    each expert gets its own palette.
+    New header: [uint32 num_weights][uint32 n_experts][per-expert: uint8 palette_size, palette]
+    """
+    # shape is reversed GGUF order: [n_experts, N, K] (slowest to fastest)
+    n_experts = shape[0] if (shape is not None and len(shape) >= 3) else 1
+    encoded = encode_palette_6b(data_u16, n_experts=n_experts)
+    num_weights = len(data_u16)
+    ws = encoded['ws_stream'].astype(np.uint8)
+    sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
+    sidecar_values  = encoded['sidecar']['values'].astype(np.uint16)
+
+    # Build per-expert palette header section
+    palettes = encoded['palette'] if n_experts > 1 else [encoded['palette']]
+    palette_header = b''
+    for pal in palettes:
+        pal = pal.astype(np.uint8)
+        palette_header += bytes([len(pal)]) + pal.tobytes()
+
+    blob = (
+        struct.pack('<II', num_weights, n_experts)
+        + palette_header
         + ws.tobytes()
         + struct.pack('<I', len(sidecar_indices))
         + sidecar_indices.tobytes()
@@ -89,6 +155,8 @@ def main():
     parser.add_argument('--input',  required=True, nargs='+',
                         help='Input BF16/F16 GGUF file(s). For split GGUFs, pass all shards in order.')
     parser.add_argument('--output', default=None,  help='Output compact SCLP GGUF file')
+    parser.add_argument('--format', choices=['sclp8', 'sclp6', 'sclp4'], default='sclp8',
+                        help='Output quantization format: sclp8 (default, 8 bits/weight), sclp6 (6 bits/weight), or sclp4 (4 bits/weight)')
     args = parser.parse_args()
 
     if args.output is None:
@@ -121,25 +189,51 @@ def main():
 
         if is_sclp_target(t.name):
             data = to_bf16_uint16(t.data, t.tensor_type)
-            blob = build_sclp_blob(data)
-
-            # Pad to even byte count for uint16 view
-            if len(blob) % 2 != 0:
-                blob += b'\x00'
-            np_blob = np.frombuffer(blob, dtype=np.uint16).copy()
+            if args.format == 'sclp4':
+                blob = build_sclp4_blob(data, shape=shape)
+                gguf_dtype = GGMLQuantizationType.SCLP4
+                # Use int8 (not uint8) to bypass GGUFWriter's quant_shape_from_byte_shape
+                # which would incorrectly double the last dimension for blck_size=2 types.
+                np_blob = np.frombuffer(blob, dtype=np.int8).copy()
+            elif args.format == 'sclp6':
+                blob = build_sclp6_blob(data, shape=shape)
+                gguf_dtype = GGMLQuantizationType.SCLP6
+                # Use int8 (not uint8) to bypass GGUFWriter's quant_shape_from_byte_shape
+                # which would incorrectly transform shape for blck_size=4 types.
+                np_blob = np.frombuffer(blob, dtype=np.int8).copy()
+            else:
+                blob = build_sclp_blob(data)
+                gguf_dtype = GGMLQuantizationType.SCLP
+                # Pad to even byte count for uint16 view
+                if len(blob) % 2 != 0:
+                    blob += b'\x00'
+                np_blob = np.frombuffer(blob, dtype=np.uint16).copy()
 
             writer.add_tensor(t.name, np_blob,
                               raw_shape=shape,
-                              raw_dtype=GGMLQuantizationType.SCLP)
+                              raw_dtype=gguf_dtype)
 
-            sc_count = struct.unpack_from('<I', blob, 5 + blob[4] + len(data))[0]
+            # Compute ws_offset from the new multi-palette header
+            n_exp = struct.unpack_from('<I', blob, 4)[0]
+            pos = 8
+            for _ in range(n_exp):
+                pos += 1 + blob[pos]  # skip palette_size + palette bytes
+            ws_offset = pos
+            if args.format == 'sclp4':
+                ws_len = (len(data) + 1) // 2
+            elif args.format == 'sclp6':
+                ws_len = ((len(data) + 3) // 4) * 3
+            else:
+                ws_len = len(data)
+            sc_count = struct.unpack_from('<I', blob, ws_offset + ws_len)[0]
             ratio = t.n_bytes / len(blob)
             total_original += t.n_bytes
             total_compact  += len(blob)
             total_sidecar  += sc_count
             n_compressed   += 1
             sc_note = f" ({sc_count} sidecar)" if sc_count else ""
-            print(f"  SCLP [{n_compressed:3d}] {t.name}: {ratio:.3f}x{sc_note}")
+            fmt_label = args.format.upper()
+            print(f"  {fmt_label} [{n_compressed:3d}] {t.name}: {ratio:.3f}x{sc_note}")
         else:
             # GGUFWriter applies quant_shape_from_byte_shape when tensor.dtype==uint8,
             # which would halve the shape. View as the native element type to avoid that.
