@@ -1,6 +1,82 @@
 import numpy as np
 
 
+def _kmeans_palette(unique_exponents: np.ndarray, counts: np.ndarray, k: int,
+                    n_iter: int = 20) -> np.ndarray:
+    """
+    1-D weighted k-means over BF16 exponent values.
+
+    Minimises sum(count[e] * (e - centroid)^2) over cluster assignments.
+    Centroids are real-valued during iteration but snapped to the nearest
+    observed exponent value at the end so every palette entry is a valid BF16
+    exponent.  Initialised with k-means++ seeding for stability.
+    """
+    if len(unique_exponents) <= k:
+        return unique_exponents.astype(np.uint8)
+
+    exponents = unique_exponents.astype(np.float32)
+    weights   = counts.astype(np.float32)
+    total_w   = weights.sum()
+
+    # k-means++ initialisation
+    rng = np.random.default_rng(42)
+    centers = [float(exponents[rng.choice(len(exponents), p=weights / total_w)])]
+    for _ in range(1, k):
+        d2 = np.array([min((e - c) ** 2 for c in centers) for e in exponents],
+                      dtype=np.float32)
+        d2_w = d2 * weights
+        centers.append(float(exponents[rng.choice(len(exponents), p=d2_w / d2_w.sum())]))
+    centers = np.array(centers, dtype=np.float32)
+
+    for _ in range(n_iter):
+        # assign each unique exponent to nearest centroid
+        dists  = np.abs(exponents[:, None] - centers[None, :])  # (U, k)
+        labels = dists.argmin(axis=1)                           # (U,)
+
+        new_centers = np.empty(k, dtype=np.float32)
+        for j in range(k):
+            mask = labels == j
+            if mask.any():
+                new_centers[j] = (exponents[mask] * weights[mask]).sum() / weights[mask].sum()
+            else:
+                # dead cluster: reinitialise to most-frequent unrepresented exponent
+                represented = set(exponents[labels == i] for i in range(k) if i != j)
+                unrepresented = [i for i, e in enumerate(exponents) if e not in represented]
+                if unrepresented:
+                    new_centers[j] = exponents[max(unrepresented, key=lambda i: weights[i])]
+                else:
+                    new_centers[j] = centers[j]
+
+        if np.allclose(centers, new_centers):
+            break
+        centers = new_centers
+
+    # snap each centroid to the nearest observed exponent value
+    snapped = []
+    for c in centers:
+        nearest = unique_exponents[np.argmin(np.abs(exponents - c))]
+        snapped.append(int(nearest))
+
+    # deduplicate while preserving order; fill any gap with next most-frequent
+    seen = set()
+    palette = []
+    for v in snapped:
+        if v not in seen:
+            seen.add(v)
+            palette.append(v)
+
+    if len(palette) < k:
+        freq_order = unique_exponents[np.argsort(-counts)]
+        for v in freq_order:
+            if int(v) not in seen:
+                seen.add(int(v))
+                palette.append(int(v))
+            if len(palette) == k:
+                break
+
+    return np.array(palette[:k], dtype=np.uint8)
+
+
 def encode_palette(clipped_weights_bf16: np.ndarray) -> dict:
     """
     Encode BF16 weights (as uint16 bit patterns) into the SCLP compressed format.
@@ -128,7 +204,8 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
     }
 
 
-def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
+def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
+                      palette_method: str = 'kmeans') -> dict:
     """
     Encode BF16 weights (as uint16 bit patterns) into the SCLP6 compressed format.
 
@@ -152,8 +229,11 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
         """Encode a single expert's weights, returning (palette, ws_bytes)."""
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
-        sorted_indices = np.argsort(-counts)
-        palette = unique_exponents[sorted_indices][:8].astype(np.uint8)
+        if palette_method == 'kmeans':
+            palette = _kmeans_palette(unique_exponents, counts, k=8)
+        else:
+            sorted_indices = np.argsort(-counts)
+            palette = unique_exponents[sorted_indices][:8].astype(np.uint8)
 
         exp_lookup = np.argmin(
             np.abs(np.arange(256, dtype=np.int16)[:, None] -
