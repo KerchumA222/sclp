@@ -123,7 +123,12 @@ VERSION 1 files (no sidecar) load correctly with an empty sidecar.
 - Python decoder is fully vectorised (no Python loop); encoder produces `ws_stream` in a single NumPy operation
 - Clipping: exponents `> threshold+1` are hard-clipped to `threshold`; exponents `== threshold+1` survive with 50% probability (flat, matches HIP XorshiftPRNG)
 - Sidecar: weights with exponents outside the top-16 palette are stored verbatim; decoder restores them exactly. Without sidecar, rare low-exponent weights would be mapped to the nearest palette exponent — catastrophic for quality.
-- **Palette selection (`encode_palette_6b`)**: defaults to `palette_method='kmeans'` (1-D weighted k-means, 20 iterations, k-means++ init). Frequency-based selection is available via `palette_method='frequency'` but produces 8× worse worst-case relative error (25500% vs 3100% max rel err on Gemma4 MoE tensors) at no compression-ratio cost. K-means protects rare low-exponent (near-zero) weights that frequency selection maps catastrophically to the nearest dense-cluster exponent; these weights matter disproportionately for MoE routing stability. SCLP8 and SCLP4 still use frequency selection (sidecar handles outliers for SCLP8; SCLP4 has only 4 palette slots where k-means gain is smaller).
+- **Palette selection**: 
+  - `encode_palette_6b` and `encode_palette_4b`: defaults to `palette_method='kmeans'` (1-D weighted k-means, 20 iterations, k-means++ init). 
+  - Frequency-based selection available via `palette_method='frequency'` but produces 8× worse worst-case relative error (25500% vs 3100% max rel err on Gemma4 MoE tensors) at no compression-ratio cost. 
+  - K-means protects rare low-exponent (near-zero) weights that frequency selection maps catastrophically to the nearest dense-cluster exponent; these weights matter disproportionately for MoE routing stability. 
+  - For SCLP4 with k=4, k-means has different tradeoffs: spreads slots across full range, worsening MSE vs frequency (7.5e-5 vs 1.7e-5) because 85% of weights cluster centrally. However, MaxRel error is significantly better. With `sidecar_dist=1`, k-means+sidecar wins clearly.
+  - `encode_palette` (SCLP8) still uses frequency selection; sidecar handles outliers.
 - `testmodule.encode(input, palette)` accepts the palette array (≤16 uint8 exponent values); the wrapper builds the nearest-neighbour lookup internally. Returns `packed`, `sm`, `sidecar_indices`, `sidecar_values` (HIP module uses separate streams internally).
 - `testmodule.decode(packed, sm, palette, sidecar_indices=[], sidecar_values=[], num_weights_hint=-1)` — sidecar and num_weights args are optional; num_weights_hint is required for odd N.
 - The `mantissa_mask` parameter of `clip` is applied as `output = weight & (0xFF80 | mantissa_mask)`; pass `0x7F` to preserve all mantissa bits
@@ -267,3 +272,25 @@ Three files were modified to support variable-size (compact) SCLP blobs:
 - non-mmap host path: reads only `min(disk_size, n_size)` bytes, zeroes the rest
 
 **`gguf-py/gguf/gguf_reader.py`** — `_build_tensors` pre-collects all tensor offsets and computes `disk_size = offset[i+1] - offset[i]`. When `disk_size != n_bytes`, reads `disk_size` bytes as a flat `uint8` array instead of the padded `n_bytes`. This handles compact SCLP GGUFs without a reshape error.
+
+## Known Issues
+
+### SCLP4 Decoder Bug (Critical)
+The SCLP4 decode kernel in `sclp_bridge.cuh` produces corrupted output: weights are incorrectly decoded to random/garbage values, resulting in incoherent text generation. The issue affects both fused-GEMV and two-pass decode paths, indicating a fundamental problem in the `sclp4_decode_blob_kernel` implementation.
+
+**Symptoms:**
+- Output contains English words interspersed with numbers and symbols (e.g., "Paris is much/well-off than guy way more123;ly-off")
+- Inference runs (model loads, tokens generate) but quality is completely broken
+
+**Investigation:**
+- Blob format appears correct (verified via Python encoder/GGUF inspection)
+- Palette header parsing looks correct (matches Python encoder layout)
+- Issue persists in both fused and two-pass decode paths
+- Likely cause: incorrect nibble unpacking, index out-of-bounds in palette lookup, or header offset calculation
+
+**Status:** Requires detailed debugging of the CUDA kernel. SCLP6 works correctly, so this appears to be SCLP4-specific. Recommend disabling SCLP4 generation or reverting to frequency-based palette selection for SCLP4 until this is fixed.
+
+### SCLP6 Inference Hang (Critical)
+In some cases, SCLP6 inference hangs after loading the model, consuming CPU time indefinitely without producing output. This does not appear to be a consistent issue and may be related to specific prompt/context combinations or GPU memory pressure.
+
+**Status:** Requires further investigation. SCLP6 works in some cases (model loading verified) but hangs in others.
