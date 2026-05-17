@@ -273,22 +273,208 @@ Three files were modified to support variable-size (compact) SCLP blobs:
 
 **`gguf-py/gguf/gguf_reader.py`** — `_build_tensors` pre-collects all tensor offsets and computes `disk_size = offset[i+1] - offset[i]`. When `disk_size != n_bytes`, reads `disk_size` bytes as a flat `uint8` array instead of the padded `n_bytes`. This handles compact SCLP GGUFs without a reshape error.
 
+## Future Work: Mixed-Precision Per-Tensor / Per-Expert
+
+Following the pattern of Q4_K_M, vary the SCLP precision across tensors to trade size for quality on the parts of the model that need it.
+
+**Per-tensor policy** (cheap, no kernel changes — multiple SCLP types coexist via per-tensor dispatch on `src0->type`):
+- Keep `token_embd` and `output` at BF16 (or SCLP6) — embedding/unembedding errors propagate to every token
+- Keep first/last 1–2 transformer blocks at SCLP6 — early-layer features and final-layer logit shaping are quality-sensitive
+- Interior MLP `fc1`/`fc2` at SCLP4 — ~85% of weights, errors are absorbed by residual stream
+- Attention projections at SCLP6 — small fraction of weights, but routing/mixing errors compound
+
+Implementation: extend `convert_to_sclp_gguf.py` with a name-pattern policy table mapping tensor name → SCLP variant. No bridge/kernel changes needed since ggml dispatches per-tensor on `src0->type`.
+
+**Per-expert policy** (MoE only, requires dispatch changes):
+- Routed-expert usage is highly skewed; hot experts at SCLP6, cold experts at SCLP4
+- Could also vary `sidecar_dist` per expert (free, no kernel change — sidecar size is already variable)
+- Requires the MoE GEMV path to handle mixed types within one tensor — non-trivial
+
+Blocked until the SCLP4 decoder bug is fixed; mixing precisions while SCLP4 produces garbage would just measure SCLP6 quality on SCLP6 tensors and noise elsewhere.
+
+## imatrix-Aware Encoding (Live — Sidecar Path Working, +1 GB for 15× PPL Win)
+
+**Status (May 2026)**: imatrix loader (`src/compression/imatrix.py`), encoder integration (`encode_palette_4b/6b`), and converter flag (`--imatrix` + `--sidecar-imatrix-budget`) all live. **Imatrix is applied to *sidecar selection*, not to palette k-means** — the naive k-means weighting was tried first and regressed PPL 5×; this version replaces it.
+
+**Calibration setup**:
+- `llama-imatrix -m gemma4-Q5_K_M.gguf -f wikitext-2-raw/wiki.train.raw --output-format dat --chunks 80 -ngl 99 -c 512 --no-ppl` → `eval_data/gemma4-imatrix.dat` (55 MB, 295 entries, ncall=80 for dense / 34 for MoE due to top-8 routing). `.dat` output works; `.gguf` output OOMs on this MoE model.
+
+**How it works** (`src/compression/encoder.py` `_encode_4b_expert` / `_encode_6b_expert`):
+- Palette uses raw exponent frequency (no imatrix), so palette quality is unaffected by activation outliers.
+- Sidecar has two tiers:
+  1. **Mandatory**: weights with `exponent_distance_to_palette > sidecar_dist` (unchanged — catastrophic-error rescue).
+  2. **Discretionary (imatrix)**: when `--imatrix` is set, additionally rescue the top `sidecar_imatrix_budget` fraction of remaining weights ranked by `activation_importance × exponent_distance`. Dist-0 weights are excluded (their only error is mantissa truncation, which sidecar can't reduce).
+- Importance per weight = `imatrix_value[col_idx]` where `col_idx = flat_index % K` (K = innermost / input dim).
+
+**Result on Gemma4-26B-A4B-IT** (wikitext-test, `-c 512 -b 512 --chunks 50`):
+
+| Config | Size | tg t/s | PPL |
+|---|---|---|---|
+| **Mixed + imatrix-sidecar 1%** | **17.5 GB** | **56** | **940** |
+| Mixed (no imatrix) | 16.2 GB | 55 | 13,909 |
+| Mixed (naive imatrix k-means) | 16.2 GB | 55 | 66,370 |
+| Q5_K_M | 18 GB | — | 18,481 |
+| SCLP6 pure | 19 GB | 56 | 341,388 |
+| SCLP4 pure | 15 GB | 2.5 | 77,053 |
+
+**Headline**: the new champion is **20× better PPL than Q5_K_M at smaller size**, **15× better than non-imatrix mixed at +8% size**, and matches pure-SCLP6 inference speed.
+
+**Why this works where k-means weighting didn't**: with only k=4 palette entries (SCLP4) the cluster centers are over-constrained by the exponent distribution itself — activation weights can shift them slightly but not enough to overcome mantissa-truncation error. The sidecar IS unconstrained per-weight; spending the imatrix signal there directly rescues the highest-impact errors. `importance × distance` correctly identifies "this weight matters AND is being quantized badly" — exactly the union we want.
+
+### Budget Sweep Results
+
+Sweep at `--sidecar-imatrix-budget` ∈ {0, 0.005, 0.01, 0.02} on Gemma4 mixed:
+
+| budget | size | sidecar % | PPL | Δ vs 0% |
+|---|---|---|---|---|
+| 0.000 | 16.18 GB | 0.91% | 13,909 | — |
+| 0.005 | 16.83 GB | 1.41% | 1,506 | 9.2× |
+| **0.010** ⭐ | **17.51 GB** | 1.91% | **940** | **14.8×** |
+| 0.020 | 18.88 GB | 2.91% | 1,026 | 13.6× |
+
+Knee at 1%. The 2% point is marginally worse than 1% (within error bars — ±62 vs ±55), suggesting we've hit the quality floor for this calibration: further sidecar slots after 1% just add file size without recovering more meaningful error. **`--sidecar-imatrix-budget 0.01` is the recommended default.**
+
+### vs Q4_K on gate/up (hybrid comparison)
+
+To isolate whether SCLP4 is the bottleneck in mixed, swapped the SCLP4-on-gate/up for Q4_K (same imatrix file used by llama-quantize):
+
+| Config | Size | PPL |
+|---|---|---|
+| **SCLP4 + imatrix-sidecar 1%** ⭐ | 17.5 GB | **940** |
+| SCLP6+Q4K hybrid + imatrix-sidecar 1% | 16.4 GB | 9,961 |
+
+Q4_K is **10.6× worse PPL** at slightly smaller size despite having access to the same imatrix calibration. The win is from concentration of precision: Q4_K spreads ~4.5 bits uniformly across every weight via per-256-block scales, while SCLP4+imatrix-sidecar gives most weights ~4 bits but stores the top ~2% (ranked by activation × distance) *verbatim*. For Gemma4-IT's weight distribution — long-tailed in `importance × reconstruction_error` — surgical lossless rescue beats uniform scaling. The Q4_K route is *not* the right knob even though it's the obvious one to try.
+
+To produce the hybrid: requires a patch to `llama-quantize` (which only honored `--tensor-type` overrides when the default type was already quantized; now applies regardless — see `src/llama-quant.cpp`). Patch is local to this fork and worth upstreaming.
+
+### Future Tuning Knobs
+
+- **Calibrate from BF16, not Q5_K_M.** Q5_K_M's own quantization noise contaminates the imatrix activations. ~3h CPU pass on the 47 GB BF16 model. Worth a few hundred PPL points if true champion is wanted.
+- **Per-tensor budget** instead of uniform — different tensor classes have different importance×distance distributions; uniform 1% may be wasteful on some, insufficient on others.
+- **Error-magnitude based sidecar** instead of `importance × distance` — actually compute the reconstruction error per weight (including mantissa truncation, not just exponent distance) and rank by `importance × actual_error`.
+
+## Future Work: imatrix-Aware Encoding (original notes below)
+
+llama.cpp's `llama-imatrix` records per-column activation magnitudes from a calibration pass (e.g. wikitext). Quantizers like Q4_K use these to weight per-column error: a weight in a high-activation column gets a proportionally larger penalty if misquantized. SCLP can use the same signal in three places:
+
+1. **Weighted k-means palette selection** — replace raw `counts` in `_kmeans_palette` with activation-magnitude-weighted counts (sum of `|activation|²` over each weight's column). Palette minimizes activation-weighted reconstruction error rather than raw bit error. Encoder-only change.
+
+2. **Smarter sidecar selection** — instead of pure `dist > sidecar_dist`, sidecar weights with the largest `activation_weight × dist` product. Same sidecar size budget, spent on weights that actually matter for output quality. Highest leverage for SCLP4 where sidecar slots are scarce.
+
+3. **Per-tensor precision budget** — per-tensor activation totals drive the per-tensor SCLP4/SCLP6 mix from the mixed-precision policy above, replacing hardcoded "first/last N blocks" heuristics with a data-driven choice.
+
+**Calibration**: one pass with `llama-imatrix` on wikitext (~10 min on RX 7900 XTX once SCLP4 is fixed) produces a `.dat` file. Extend `convert_to_sclp_gguf.py` with `--imatrix path.dat` to consume it.
+
+Blocked on the SCLP4 decoder fix.
+
 ## Known Issues
 
-### SCLP4 Decoder Bug (Critical)
-The SCLP4 decode kernel in `sclp_bridge.cuh` produces corrupted output: weights are incorrectly decoded to random/garbage values, resulting in incoherent text generation. The issue affects both fused-GEMV and two-pass decode paths, indicating a fundamental problem in the `sclp4_decode_blob_kernel` implementation.
+### SCLP4 VRAM Allocation (Resolved on Llama-3, Pending on Gemma4)
 
-**Symptoms:**
-- Output contains English words interspersed with numbers and symbols (e.g., "Paris is much/well-off than guy way more123;ly-off")
-- Inference runs (model loads, tokens generate) but quality is completely broken
+**Original symptom:** SCLP4 inference produced garbage output across models. Earlier `get_alloc_size` for SCLP4 reserved only `1.25 × ggml_nbytes`, but on disk the blob is `header + N/2 (ws) + 6 × sidecar_count`. Per-tensor sidecar fractions are wildly model-dependent:
 
-**Investigation:**
-- Blob format appears correct (verified via Python encoder/GGUF inspection)
-- Palette header parsing looks correct (matches Python encoder layout)
-- Issue persists in both fused and two-pass decode paths
-- Likely cause: incorrect nibble unpacking, index out-of-bounds in palette lookup, or header offset calculation
+- Gemma4 26B MoE: max blob ratio **1.26×** (mostly low-exponent-spread MoE weights)
+- Llama-3-8B: max blob ratio **2.34×** on `attn_q.weight` (~11% sidecar — Llama's weight distribution has a broader exponent tail than Gemma4's)
 
-**Status:** Requires detailed debugging of the CUDA kernel. SCLP6 works correctly, so this appears to be SCLP4-specific. Recommend disabling SCLP4 generation or reverting to frequency-based palette selection for SCLP4 until this is fixed.
+When `disk_size > alloc_size`, the loader's `ggml_backend_tensor_set` asserted out (with `--no-mmap`) or silently truncated the blob (with mmap — producing garbage downstream as the kernel read undefined memory past the truncation point, especially the sidecar_count field which then scatter-corrupted random output positions).
+
+**Fix:** `get_alloc_size` for SCLP4 now returns `3 × ggml_nbytes + 64KB` (= 1.5 × N bytes). This is enough for Llama-3-8B's worst tensor and any plausible sidecar fraction up to ~16%. Also fixed `ggml_backend_tensor_set_async` to check `alloc_size` (matching the sync version's bound) so the non-mmap GPU upload path no longer asserts.
+
+**Verified working:** Llama-3-8B SCLP4-kmeans-sc1 — loads, generates at 25.88 t/s (≈3× BF16 read bandwidth), grammatically coherent English output (semantic quality is poor as expected at 4 bits/weight, not a bug).
+
+### SCLP disk_size Hint via op_params
+
+To make `get_alloc_size` exact per tensor (so Gemma4 doesn't OOM and Llama-3-8B doesn't truncate), the model loader stashes each SCLP tensor's `disk_size` into `tensor->op_params` immediately after `create_tensor`. CUDA's `get_alloc_size` reads it back and reserves exactly `disk_size` rounded up to 256B buffer alignment. The heuristic (3× for SCLP4, 1.25× for SCLP/SCLP6) remains only as a fallback when no hint is present (e.g., compute-graph temporaries).
+
+**Layout in `op_params[16]`** (last three slots — see `llama-model-loader.cpp::create_tensor`):
+- `op_params[13]` — magic `0x504C4353` (`'SCLP'`) sentinel
+- `op_params[14]` — low 32 bits of `disk_size`
+- `op_params[15]` — high 32 bits of `disk_size`
+
+**Why this is OK today.** `op_params` is convention-reserved for the *operation* that produced a tensor; weight tensors loaded from a GGUF have `op == GGML_OP_NONE`, so `op_params` is zero-initialized and unused. No ggml code currently reads or writes `op_params` on `GGML_OP_NONE` tensors.
+
+**Risks to watch for** (this is intentionally fragile — convention, not enforcement):
+1. **Upstream ggml changes.** A future ggml release could start using `op_params` on weight tensors (e.g., to carry quantization metadata) or assert `op_params == 0` for `OP_NONE`. On a tracking fork, this would silently corrupt the hint or crash on merge. Mitigation: on each upstream merge, grep for new `op_params` writers/readers and verify `OP_NONE` paths still leave the field clear.
+2. **View / transpose propagation.** Some tensor constructors (`ggml_view_*`, `ggml_transpose`, `ggml_dup_tensor`) `memset` `op_params` to zero, others inherit it. If a view of an SCLP weight is ever materialized and allocated separately, the hint could leak into a non-SCLP context. Mitigation: `get_alloc_size` only honors the hint for SCLP-typed tensors, so a leaked hint on a BF16 view is ignored. If we ever make views of SCLP tensors typed as SCLP, audit the constructor path.
+3. **Debug / serialization tooling.** Graph dumpers and gguf writers may render `op_params` as op-meaningful values; for SCLP weight tensors the trailing slots will show a `disk_size`-shaped uint64 with the `'SCLP'` sentinel. Mitigation: documented here; if needed, add a "clear hint" helper and call it before any serialization that round-trips `op_params`.
+4. **The sentinel collides with a real op_params value.** Extremely unlikely (`0x504C4353` is not a sensible numeric op param), but possible. Mitigation: only check the sentinel on SCLP-typed tensors; non-SCLP tensors are unaffected.
+
+**Stronger long-term alternatives** if any of the above bites:
+- Add a real field to `ggml_tensor` (e.g., `size_t alloc_size_hint`). Invasive but unambiguous.
+- Side-table `std::unordered_map<const ggml_tensor*, size_t>` inside the CUDA buffer-type context, populated by a loader callback. No ggml-field abuse, slightly more code.
+- Encode `disk_size` as a GGUF per-tensor KV. Persistent and explicit, but redundant — the value is already implicit in consecutive tensor offsets.
+
+### Future Work: Converter-Side Precision Fallback
+
+Even with exact alloc, a tensor whose SCLP4 blob exceeds its BF16 size is pathological — the converter should detect that case at encode time and fall back to BF16 (or SCLP6) for that specific tensor. This is the natural on-ramp to the mixed-precision idea above: instead of a hardcoded per-name policy, drive precision selection by measured per-tensor compression efficiency.
+
+## Future Work: TurboQuant for KV Cache
+
+Google's TurboQuant (2024) compresses the attention KV cache via per-token learned rotation + low-bit quantization, dramatically cutting the dominant runtime memory cost at long contexts. A community llama.cpp fork already implements it (find via the upstream issue tracker for "TurboQuant" / "kv-cache rotation"). Worth bringing in because:
+
+- SCLP compresses *weights* — wins big on bandwidth-bound generation (load less from VRAM per token), modest VRAM savings.
+- TurboQuant compresses the *KV cache* — wins big on long-context VRAM (KV grows with sequence length, weights don't).
+- The two are orthogonal: a model with both gets compounded VRAM savings, especially on Gemma4-26B-A4B where long context blows up KV faster than weights.
+
+Integration path: identify the fork, cherry-pick the KV cache rotation/quantization changes on top of our rebased `sclp` branch, smoke-test on Llama-3-8B first (no SCLP), then layer onto SCLP-compressed weights. Expected friction: the KV cache lives in a different code path from weight loading, so SCLP and TurboQuant changes shouldn't conflict structurally — but ggml's KV cache types and graph nodes have churned, so plan on rebase work.
+
+## Mixed-Precision Status (Gemma4, May 2026)
+
+`convert_to_sclp_gguf.py --format mixed` applies a name-based per-tensor policy:
+
+- `attn_q/k/v/output`, `ffn_down`, `ffn_down_exps` → **SCLP6** (errors compound through softmax / pre-residual add)
+- `ffn_gate/up`, `ffn_gate_exps`, `ffn_up_exps`, `ffn_gate_up_exps` → **SCLP4** (bulk of weights, errors partially absorbed by GeGLU)
+- `token_embd`, `output`, all norms/scales → **verbatim BF16/F16**
+
+On Gemma4-26B-A4B-IT with `--jinja`:
+
+| Config | Size | tg t/s | Output |
+|---|---|---|---|
+| BF16 | 48 GB | (CPU only) | ✓ |
+| SCLP6 pure | 19 GB | 56 | ✓ |
+| **Mixed (fused SCLP4 MoE GEMV)** | **17 GB** | **55** | ✓ |
+| SCLP4-kmeans-sc1 pure | 15 GB | 2.5 | ✗ mode collapse |
+
+Pure SCLP4 mode-collapses on Gemma4-IT (`"own own own own..."`). The decode kernel is byte-perfect (verified on real MoE blobs up to 508M weights), so this is genuinely quantization noise — Gemma4's instruction-tuned weight distribution is too tight for k=4-palette + 1-mantissa-bit. Llama-3-8B SCLP4 produces incoherent-but-diverse English (high PPL, no collapse).
+
+Mixed is now pareto-optimal: matches SCLP6 speed (within 2%), saves 2 GB, same quality. Further size wins require pushing more tensors to SCLP4 — `ffn_down_exps` (residual-stream feeder) is the obvious candidate but needs measured per-tensor evaluation, not a name policy.
+
+### Fused SCLP4 MoE GEMV
+
+`sclp4_fused_moe_gemv_kernel` in `sclp_bridge.cuh` mirrors `sclp6_fused_moe_gemv_kernel`:
+- One block per `(row_tile, active_expert_slot)`; one warp per output row of the routed expert.
+- Decodes only the routed experts' bytes inline (4×4 shared-mem LUT for `(pidx, smn) → float`), never materializes a full BF16 expert buffer.
+- Shared memory: 4 (ws_offset) + 64 (LUT) + K × 4 (activation broadcast) bytes.
+- Sidecar omitted (per documented SCLP convention — block-scoped scan caused ~37% regression on SCLP).
+- Wired into `ggml_cuda_mul_mat_id` for `GGML_TYPE_SCLP4` when `n_batches == 1`; prefill still uses the existing two-pass decode → recursive `mul_mat_id`.
+
+Without this kernel, SCLP4 MoE inference goes through two-pass decode every token, decoding ALL 128 experts when only 8 are routed — a 16× waste plus a 1 GB BF16 temp buffer per layer per token. With it, mixed-precision matches SCLP6 speed.
+
+### Perplexity Comparison
+
+Wikitext-2-raw, `-c 512 -b 512 --chunks 50` on Gemma4-26B-A4B-IT:
+
+| Config | Size | tg t/s | PPL (final) | PPL (chunk 1) |
+|---|---|---|---|---|
+| **Mixed (fused MoE GEMV)** | **17 GB** | **55** | **13,909** ± 940 | 303,636 |
+| Q5_K_M | 18 GB | — | 18,481 ± 1,282 | — |
+| SCLP4-kmeans-sc1 pure | 15 GB | 2.5 | 77,053 ± 5,107 | (similar) |
+| SCLP6-kmeans pure | 19 GB | 56 | **236,609,342** ± 19M | 3,018,680,874 |
+
+**Caveat: absolute PPL is inflated by ~3 orders of magnitude** because Gemma4-IT is an instruction-tuned model and wikitext is OOD prose. Use the *ranking* and *anomalies*, not the absolute numbers. A healthy Gemma4-IT on OOD wikitext should be ~50-200; chat-formatted eval would give the meaningful number. (For reference: Llama-3-8B base hits PPL ~10 on the same setup.)
+
+**Key findings:**
+1. **Mixed beats Q5_K_M on quality at smaller size** (13,909 vs 18,481, 17 GB vs 18 GB). The per-tensor precision policy is a real win.
+2. **SCLP4 pure at 77K confirms mode collapse quantitatively** — 5× worse than mixed.
+3. **SCLP6 pure at 236M turned out to be two stacked issues, not a prefill bug.** Investigation:
+   - The SCLP6 GGUF on disk was generated 4 minutes *before* the k-means palette commit landed, so it used frequency-based palette selection with documented worst-case relative error of 25,500% on Gemma4 MoE tensors. Regenerating with the current encoder (k-means + sidecar_dist=1) drops PPL from 236,609,342 → **341,388** (700× improvement). Inference quality verified: "Paris." at 56 t/s.
+   - The remaining 24× gap between SCLP6-kmeans-sc1 (341K) and mixed (14K) is *real but not a bug*. It reflects a quality cliff for Gemma4-IT: per-tensor error metrics show **SCLP4-kmeans-sc1 has 7× higher MSE but 1.8× lower MaxAbsErr than SCLP6-kmeans-sc1**, because SCLP4's smaller palette (4 vs 8 entries) pushes 1.36% of weights into the lossless sidecar vs SCLP6's 0.07%. Gemma4-IT is sensitive to worst-case weight error, so SCLP4 wins despite worse average error. Mixed inherits SCLP4 on `ffn_gate_up_exps` (where this matters most) and SCLP6 on attention (where average error matters more).
+   - Generation always took the fused MoE GEMV path (`n_batches==1`) which is more numerically forgiving than two-pass decode → rocBLAS batched GEMM, which is why the issue was invisible at generation but blew up under `llama-perplexity` at batch 512.
+   - **Attempted fix that didn't work**: changed encoder's sidecar threshold from `> sidecar_dist` to `>= sidecar_dist`, which with `sidecar_dist=1` sidecars *every* weight not exactly at a palette exponent. Re-encoded SCLP6 ballooned from 19 GB → 25 GB (5% sidecar vs 0.07%), exceeded 24 GB VRAM, didn't load. Reverted the change. A targeted error-based sidecar policy (sidecar weights whose mapped reconstruction error exceeds a threshold) is the next direction to try if pursuing — but `mixed` already dominates pure SCLP6 on size *and* speed *and* PPL, so this isn't on the critical path. Stale-GGUF (item above) was the actionable fix; everything else here is post-mortem.
+
+**Practical takeaway**: regenerate any SCLP6 GGUF older than 2026-05-16 10:19 — it likely uses frequency-based palette selection. Anything generated after that is fine. Mixed-precision (`--format mixed`) is the best Gemma4 config end-to-end.
+
+Methodology note: re-run with chat-formatted prompts (template-applied wikitext, or a true Gemma-style eval set) to get absolute PPLs that can be compared to published numbers. For our purposes (ranking SCLP variants against each other and against Q5_K_M on the same eval setup), the current numbers are sufficient.
 
 ### SCLP6 Inference Hang (Critical)
 In some cases, SCLP6 inference hangs after loading the model, consuming CPU time indefinitely without producing output. This does not appear to be a consistent issue and may be related to specific prompt/context combinations or GPU memory pressure.

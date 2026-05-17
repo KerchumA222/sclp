@@ -136,7 +136,10 @@ def encode_palette(clipped_weights_bf16: np.ndarray) -> dict:
 
 def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
                       palette_method: str = 'kmeans',
-                      sidecar_dist: int = 0) -> dict:
+                      sidecar_dist: int = 0,
+                      importance: np.ndarray | None = None,
+                      K: int | None = None,
+                      sidecar_imatrix_budget: float = 0.0) -> dict:
     """
     Encode BF16 weights (as uint16 bit patterns) into the SCLP4 compressed format.
 
@@ -149,18 +152,39 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
     sidecar_dist: same semantics as encode_palette_6b. For SCLP4 the gain is larger
     because frequency k=4 leaves ~15% of weights uncovered.
 
+    importance: optional float32[n_experts, K] activation-importance per (expert, input-column)
+                from an imatrix. When provided, the k-means palette selection is weighted by
+                activation magnitude instead of raw exponent frequency — palette entries
+                cluster toward exponents that appear in high-activation columns. Requires K
+                (the input dim, = ne[0]) so we can fold importance over the per-weight layout.
+
     BF16 reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top1<<6)
     """
     weights = weights_uint16.flatten().astype(np.uint16)
     num_weights = len(weights)
 
+    if importance is not None:
+        if K is None:
+            raise ValueError("encode_palette_4b: K (input dim) is required when importance is provided")
+        if importance.shape != (n_experts, K):
+            raise ValueError(f"encode_palette_4b: importance shape {importance.shape} != ({n_experts}, {K})")
+
     sidecar_indices_all = []
     sidecar_values_all  = []
 
-    def _encode_4b_expert(expert_weights, expert_offset=0):
-        """Encode a single expert's weights, returning (palette, ws_bytes)."""
+    def _encode_4b_expert(expert_weights, expert_offset=0, expert_imp=None):
+        """Encode a single expert's weights, returning (palette, ws_bytes).
+
+        Palette selection always uses raw exponent frequency (importance-weighted
+        k-means was tried and regressed PPL — see CLAUDE.md). When expert_imp is
+        provided, importance is applied to *sidecar selection* instead: weights are
+        ranked by `importance × exponent_distance_to_palette` and the top
+        `sidecar_imatrix_budget` fraction joins the lossless sidecar in addition to
+        the mandatory `dist > sidecar_dist` group.
+        """
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
+
         if palette_method == 'kmeans':
             palette = _kmeans_palette(unique_exponents, counts, k=4)
         else:
@@ -179,12 +203,39 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
         ).astype(np.uint8)
         indices = exp_lookup[exponents].astype(np.uint8)
 
+        per_weight_dist = dist_per_exp[exponents]  # int16
+
+        # Mandatory sidecar: catastrophic distance > sidecar_dist (matches non-imatrix path).
         if sidecar_dist > 0:
-            outlier_mask = dist_per_exp[exponents] > sidecar_dist
-            if outlier_mask.any():
-                out_pos = np.where(outlier_mask)[0].astype(np.uint32)
-                sidecar_indices_all.append(out_pos + expert_offset)
-                sidecar_values_all.append(expert_weights[outlier_mask])
+            outlier_mask = per_weight_dist > sidecar_dist
+        else:
+            outlier_mask = np.zeros(len(expert_weights), dtype=bool)
+
+        # Discretionary sidecar (imatrix-aware): on top of the mandatory set, rescue the
+        # top `sidecar_imatrix_budget` fraction of remaining weights ranked by
+        # `importance × distance`. Weights with dist == 0 contribute 0 priority and
+        # never get rescued (their only error is mantissa truncation, which sidecar
+        # can't avoid). Weights with high importance × distance dominate the ranking.
+        if expert_imp is not None and sidecar_imatrix_budget > 0.0:
+            K_dim = expert_imp.shape[0]
+            col_idx = np.arange(len(expert_weights), dtype=np.int64) % K_dim
+            per_weight_imp = expert_imp[col_idx]  # float32, broadcast over rows
+            priority = per_weight_imp * per_weight_dist.astype(np.float32)
+            # Exclude already-mandatory entries from the ranking.
+            priority = np.where(outlier_mask, -np.inf, priority)
+            n_extra = int(len(expert_weights) * sidecar_imatrix_budget)
+            if n_extra > 0:
+                # argpartition gives indices of the top n_extra by priority.
+                cand = np.argpartition(priority, -n_extra)[-n_extra:]
+                # Only keep ones with strictly positive priority (otherwise we'd be
+                # sidecaring dist-0 weights, which is wasteful).
+                cand = cand[priority[cand] > 0]
+                outlier_mask[cand] = True
+
+        if outlier_mask.any():
+            out_pos = np.where(outlier_mask)[0].astype(np.uint32)
+            sidecar_indices_all.append(out_pos + expert_offset)
+            sidecar_values_all.append(expert_weights[outlier_mask])
 
         sign          = ((expert_weights >> 15) & 0x1).astype(np.uint8)
         mantissa_top1 = ((expert_weights >> 6)  & 0x1).astype(np.uint8)
@@ -202,14 +253,16 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
         return palette, ws
 
     if n_experts == 1:
-        palette, ws_stream = _encode_4b_expert(weights, expert_offset=0)
+        eimp = importance[0] if importance is not None else None
+        palette, ws_stream = _encode_4b_expert(weights, expert_offset=0, expert_imp=eimp)
     else:
         expert_nw = num_weights // n_experts
         expert_palettes = []
         ws_parts = []
         for e in range(n_experts):
             ew = weights[e * expert_nw:(e + 1) * expert_nw]
-            pal, ws = _encode_4b_expert(ew, expert_offset=e * expert_nw)
+            eimp = importance[e] if importance is not None else None
+            pal, ws = _encode_4b_expert(ew, expert_offset=e * expert_nw, expert_imp=eimp)
             expert_palettes.append(pal)
             ws_parts.append(ws)
         palette = expert_palettes  # list of arrays
@@ -234,7 +287,10 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
 
 def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
                       palette_method: str = 'kmeans',
-                      sidecar_dist: int = 0) -> dict:
+                      sidecar_dist: int = 0,
+                      importance: np.ndarray | None = None,
+                      K: int | None = None,
+                      sidecar_imatrix_budget: float = 0.0) -> dict:
     """
     Encode BF16 weights (as uint16 bit patterns) into the SCLP6 compressed format.
 
@@ -249,6 +305,9 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
     0 = no sidecar (default, fully lossy). 1 is recommended: captures ~0.1% of
     weights responsible for the worst-case errors with negligible size overhead.
 
+    importance: optional float32[n_experts, K] activation magnitudes from imatrix.
+                Same semantics as encode_palette_4b.
+
     BF16 reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top2<<5)
 
     Byte packing (4 weights → 3 bytes):
@@ -259,13 +318,24 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
     weights = weights_uint16.flatten().astype(np.uint16)
     num_weights = len(weights)
 
+    if importance is not None:
+        if K is None:
+            raise ValueError("encode_palette_6b: K is required when importance is provided")
+        if importance.shape != (n_experts, K):
+            raise ValueError(f"encode_palette_6b: importance shape {importance.shape} != ({n_experts}, {K})")
+
     sidecar_indices_all = []
     sidecar_values_all  = []
 
-    def _encode_6b_expert(expert_weights, expert_offset=0):
-        """Encode a single expert's weights, returning (palette, ws_bytes)."""
+    def _encode_6b_expert(expert_weights, expert_offset=0, expert_imp=None):
+        """Encode a single expert's weights, returning (palette, ws_bytes).
+
+        Palette selection always uses raw exponent frequency. When expert_imp is
+        provided, importance is applied to sidecar selection (see SCLP4 docstring).
+        """
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
+
         if palette_method == 'kmeans':
             palette = _kmeans_palette(unique_exponents, counts, k=8)
         else:
@@ -286,15 +356,30 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
         ).astype(np.uint8)
         indices = exp_lookup[exponents].astype(np.uint8)
 
-        # sidecar: weights whose exponent is too far from any palette entry
+        per_weight_dist = dist_per_exp[exponents]
+
         if sidecar_dist > 0:
-            outlier_mask = dist_per_exp[exponents] > sidecar_dist
-            if outlier_mask.any():
-                out_pos = np.where(outlier_mask)[0].astype(np.uint32)
-                sidecar_indices_all.append(out_pos + expert_offset)
-                sidecar_values_all.append(expert_weights[outlier_mask])
-                # map outliers to nearest palette entry in ws_stream (will be overwritten at decode)
-                # indices already set correctly via exp_lookup; only the sidecar rescues the value
+            outlier_mask = per_weight_dist > sidecar_dist
+        else:
+            outlier_mask = np.zeros(len(expert_weights), dtype=bool)
+
+        # Imatrix-aware discretionary sidecar (see SCLP4 implementation comment).
+        if expert_imp is not None and sidecar_imatrix_budget > 0.0:
+            K_dim = expert_imp.shape[0]
+            col_idx = np.arange(len(expert_weights), dtype=np.int64) % K_dim
+            per_weight_imp = expert_imp[col_idx]
+            priority = per_weight_imp * per_weight_dist.astype(np.float32)
+            priority = np.where(outlier_mask, -np.inf, priority)
+            n_extra = int(len(expert_weights) * sidecar_imatrix_budget)
+            if n_extra > 0:
+                cand = np.argpartition(priority, -n_extra)[-n_extra:]
+                cand = cand[priority[cand] > 0]
+                outlier_mask[cand] = True
+
+        if outlier_mask.any():
+            out_pos = np.where(outlier_mask)[0].astype(np.uint32)
+            sidecar_indices_all.append(out_pos + expert_offset)
+            sidecar_values_all.append(expert_weights[outlier_mask])
 
         sign          = ((expert_weights >> 15) & 0x1).astype(np.uint8)
         mantissa_top2 = ((expert_weights >> 5)  & 0x3).astype(np.uint8)
@@ -317,14 +402,16 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
         return palette, ws
 
     if n_experts == 1:
-        palette, ws_stream = _encode_6b_expert(weights, expert_offset=0)
+        eimp = importance[0] if importance is not None else None
+        palette, ws_stream = _encode_6b_expert(weights, expert_offset=0, expert_imp=eimp)
     else:
         expert_nw = num_weights // n_experts
         expert_palettes = []
         ws_parts = []
         for e in range(n_experts):
             ew = weights[e * expert_nw:(e + 1) * expert_nw]
-            pal, ws = _encode_6b_expert(ew, expert_offset=e * expert_nw)
+            eimp = importance[e] if importance is not None else None
+            pal, ws = _encode_6b_expert(ew, expert_offset=e * expert_nw, expert_imp=eimp)
             expert_palettes.append(pal)
             ws_parts.append(ws)
         palette = expert_palettes  # list of arrays
