@@ -251,7 +251,14 @@ A first cut of the fused decode+GEMM MoE prefill kernel lives in `sclp_bridge.cu
 
 Perf with env var on (Gemma4 MIXED-imatrix-1%): **pp512 = 2822 t/s vs 1699 two-pass vs 2937 Q5_K_M** — 1.66× speedup, matches the Q5_K_M ceiling. tg unchanged (different path). Confirms the fused architecture is the right approach.
 
-**Correctness bug**: PPL 259K vs 13.9K baseline on wikitext-test (3 chunks). Output is structurally non-random but quantitatively wrong. Default path stays two-pass until fixed. Triage candidates in the kernel header comment (`sclp4_fused_moe_wmma_kernel`): src1->ne[1] semantics for prefill MoE, single-warp WMMA fragment packing differences vs the 4-warp SCLP8 reference, expert-bin scan edge cases. Next debugging step is a synthetic-input diff test against the two-pass path on a single tensor to isolate routing vs GEMM as the bug source.
+**Correctness bug**: PPL 259K vs 13.9K baseline on wikitext-test (3 chunks). Output is structurally non-random but quantitatively wrong.
+
+**Diff harness landed** (`SCLP_FUSED_MOE_WMMA_DIFF=1`) — runs both paths in the SCLP4 dispatch, D2H-copies outputs, prints per-slot stats. Reveals:
+- src1 ne=[2816, 1, 2, 1], ids ne=[128, 2] for Gemma4 (top-128 dense routing, src1 broadcast across slots — confirmed)
+- Fused outputs are plausible (avg |x|~0.4, max ~1.7, all 1408 cells nonzero)
+- **Two-pass reference dst reads as ALL ZEROS in diff mode** even though src1 is non-zero and the decoded BF16 weight buffer is populated. A sentinel 9999 at dst[0] gets overwritten to 0 by the recursive call. With harness disabled, the same two-pass path produces correct PPL=13.9K. Ruled out: pool aliasing (raw hipMalloc reproduces the same zero ref). The diff-harness vs production discrepancy is unexplained — possibly mul_mat_id+glu graph fusion decouples this dst from the recursive call's logical output.
+
+**Next debug step**: bypass D2H entirely with an on-device diff kernel (compute max-abs-diff per output row on GPU, copy only the stats back), or compute a CPU-side reference for one MoE call and compare. Either should sidestep the harness anomaly.
 
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
