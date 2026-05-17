@@ -241,7 +241,17 @@ After-fix prefill landscape (gfx1100, RX 7900 XTX):
 | Llama-3-8B | SCLP4-kmeans-sc1 | **3324** | **beats Q8_0 (2900)** |
 | Gemma4 MoE | MIXED+imatrix 1% | **1699** | 58% of Q5_K_M (2937) |
 
-**Remaining MoE gap is the real ceiling.** With the BF16 spill eliminated as the bottleneck, the residual gap on Gemma4 MoE is rocBLAS BF16 hgemm efficiency on per-expert batched shapes. `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1` does not help (1679 vs 1699). Closing it would require a fused decode+MoE-GEMM kernel using RDNA3 WMMA — analogous to our existing fused MoE GEMV but for prefill — a substantial standalone project (~1 week of WMMA tiling work). Not pursued yet; dense SCLP already beats Q8_0 on prefill, and MoE prefill is already within 2× of the best non-SCLP quant.
+**Remaining MoE gap is the real ceiling for the two-pass path.** With the BF16 spill eliminated as the decode bottleneck, the residual gap on Gemma4 MoE is rocBLAS BF16 hgemm efficiency on per-expert batched shapes. `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1` does not help (1679 vs 1699).
+
+### Fused SCLP4 MoE WMMA Prefill Kernel (WIP — perf right, correctness bug)
+
+A first cut of the fused decode+GEMM MoE prefill kernel lives in `sclp_bridge.cuh` (`sclp4_fused_moe_wmma_kernel` + `sclp_moe_route_sort_kernel`), wired behind `SCLP_FUSED_MOE_WMMA=1`. Strategy:
+1. Routing-sort kernel bins flat slots `(i_active + i_batch*n_active)` by expert id with each bin padded to TILE=16 so WMMA m-tiles align to single experts.
+2. Single-warp WMMA kernel: each block computes one 16×16 (N×M) output tile for one expert, decoding SCLP4 nibbles directly into the A fragment.
+
+Perf with env var on (Gemma4 MIXED-imatrix-1%): **pp512 = 2822 t/s vs 1699 two-pass vs 2937 Q5_K_M** — 1.66× speedup, matches the Q5_K_M ceiling. tg unchanged (different path). Confirms the fused architecture is the right approach.
+
+**Correctness bug**: PPL 259K vs 13.9K baseline on wikitext-test (3 chunks). Output is structurally non-random but quantitatively wrong. Default path stays two-pass until fixed. Triage candidates in the kernel header comment (`sclp4_fused_moe_wmma_kernel`): src1->ne[1] semantics for prefill MoE, single-warp WMMA fragment packing differences vs the 4-warp SCLP8 reference, expert-bin scan edge cases. Next debugging step is a synthetic-input diff test against the two-pass path on a single tensor to isolate routing vs GEMM as the bug source.
 
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
