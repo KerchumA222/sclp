@@ -228,6 +228,21 @@ Use `llama-completion`, not `llama-cli`. `llama-cli` does not support `-no-cnv`.
 
 tg wins because SCLP reads 8 bits/weight vs 16 for BF16. pp lags Q8_0 because the two-pass decode (decode blob → BF16 → rocBLAS GEMM) adds a full weight-matrix read before the GEMM; Q8_0 goes directly through rocBLAS INT8.
 
+### Prefill Optimization (May 2026)
+
+A `hipMemsetAsync` stub in `llama_sclp{,4,6}_dispatch` (gated on `SCLP_MEMSET_STUB`) replaces the decode kernels for profiling. With the stub, pp512 on Gemma4 MIXED jumped 578 → 1696 t/s — proving decode was ~66% of prefill kernel time, *not* rocBLAS GEMM.
+
+Root cause: the SCLP4/SCLP6 decode kernels were writing scalar `uint16` outputs (16 per thread for SCLP4, 4 for SCLP6) — store-bandwidth-bound. Replacing with `2× uint4` (SCLP4) and `1× uint64` (SCLP6) vectorized stores recovered nearly the full stub headroom: **pp512 578 → 1699 t/s (2.94×)**, bit-identical output.
+
+After-fix prefill landscape (gfx1100, RX 7900 XTX):
+
+| Model | Config | pp512 t/s | vs reference |
+|---|---|---|---|
+| Llama-3-8B | SCLP4-kmeans-sc1 | **3324** | **beats Q8_0 (2900)** |
+| Gemma4 MoE | MIXED+imatrix 1% | **1699** | 58% of Q5_K_M (2937) |
+
+**Remaining MoE gap is the real ceiling.** With the BF16 spill eliminated as the bottleneck, the residual gap on Gemma4 MoE is rocBLAS BF16 hgemm efficiency on per-expert batched shapes. `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1` does not help (1679 vs 1699). Closing it would require a fused decode+MoE-GEMM kernel using RDNA3 WMMA — analogous to our existing fused MoE GEMV but for prefill — a substantial standalone project (~1 week of WMMA tiling work). Not pursued yet; dense SCLP already beats Q8_0 on prefill, and MoE prefill is already within 2× of the best non-SCLP quant.
+
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
 `/home/ajkerchum/llama.cpp/ggml/src/ggml-cuda/sclp_bridge.cuh` implements the on-device decode path:
