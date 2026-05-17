@@ -230,35 +230,36 @@ tg wins because SCLP reads 8 bits/weight vs 16 for BF16. pp lags Q8_0 because th
 
 ### Prefill Optimization (May 2026)
 
-A `hipMemsetAsync` stub in `llama_sclp{,4,6}_dispatch` (gated on `SCLP_MEMSET_STUB`) replaces the decode kernels for profiling. With the stub, pp512 on Gemma4 MIXED jumped 578 → 1696 t/s — proving decode was ~66% of prefill kernel time, *not* rocBLAS GEMM.
+**Caution — earlier write-up was bogus** due to `-DSCLP_MEMSET_STUB=1` getting stuck in CMakeCache during profiling. The flag stubbed `llama_sclp{,4,6}_dispatch` to `hipMemsetAsync` (zero-fill BF16 weight buffer), making the rocBLAS GEMM produce all-zero output. Every subsequent build for ~a session ran with that stub on, inflating pp numbers to the memset-bandwidth ceiling and producing zero-output PPL that we mistook for "still close to baseline" because the *original* baseline measurements were also taken in that same session. The stub mechanism has now been removed entirely (see llama.cpp `b0306ab2c`).
 
-Root cause: the SCLP4/SCLP6 decode kernels were writing scalar `uint16` outputs (16 per thread for SCLP4, 4 for SCLP6) — store-bandwidth-bound. Replacing with `2× uint4` (SCLP4) and `1× uint64` (SCLP6) vectorized stores recovered nearly the full stub headroom: **pp512 578 → 1699 t/s (2.94×)**, bit-identical output.
+**Real numbers (clean build, gfx1100 RX 7900 XTX):**
 
-After-fix prefill landscape (gfx1100, RX 7900 XTX):
+| Model | Config | pp512 t/s | tg t/s | vs reference |
+|---|---|---|---|---|
+| Llama-3-8B | SCLP4-kmeans-sc1 | 2574 | 25.5 | 78% of Q8_0's 3276 |
+| Llama-3-8B | Q8_0 | 3276 | 81 | (reference) |
+| Gemma4 MoE | MIXED+imatrix 1%, two-pass | 615 | 55.4 | 21% of Q5_K_M's 2937 |
+| Gemma4 MoE | MIXED+imatrix 1%, fused WMMA on (broken) | 845 | 55.4 | +38% but PPL=10^8 |
 
-| Model | Config | pp512 t/s | vs reference |
-|---|---|---|---|
-| Llama-3-8B | SCLP4-kmeans-sc1 | **3324** | **beats Q8_0 (2900)** |
-| Gemma4 MoE | MIXED+imatrix 1% | **1699** | 58% of Q5_K_M (2937) |
+What survived from the earlier session:
+- The hipMemset stub *did* validly tell us decode work matters; the magnitude was just garbled. With the stub gone, vectorized SCLP4/SCLP6 stores still represent a real (small) win (~6% on Gemma4 prefill vs scalar stores).
+- Decode-vs-GEMM ratio in the two-pass path is no longer cleanly profiled; needs to be redone with `hipEventRecord` timers (not a global stub) when prioritized.
 
-**Remaining MoE gap is the real ceiling for the two-pass path.** With the BF16 spill eliminated as the decode bottleneck, the residual gap on Gemma4 MoE is rocBLAS BF16 hgemm efficiency on per-expert batched shapes. `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1` does not help (1679 vs 1699).
+### Fused SCLP4 MoE WMMA Prefill Kernel (WIP — real bug, not yet fixed)
 
-### Fused SCLP4 MoE WMMA Prefill Kernel (WIP — perf right, correctness bug)
+The fused decode+GEMM MoE prefill kernel (`sclp4_fused_moe_wmma_kernel` + `sclp_moe_route_sort_kernel` in `sclp_bridge.cuh`, behind `SCLP_FUSED_MOE_WMMA=1`) does **+38% prefill** (615 → 845 t/s on Gemma4 MIXED) but PPL is catastrophically wrong (~10^8 vs 3469 baseline on wikitext-test 3 chunks).
 
-A first cut of the fused decode+GEMM MoE prefill kernel lives in `sclp_bridge.cuh` (`sclp4_fused_moe_wmma_kernel` + `sclp_moe_route_sort_kernel`), wired behind `SCLP_FUSED_MOE_WMMA=1`. Strategy:
-1. Routing-sort kernel bins flat slots `(i_active + i_batch*n_active)` by expert id with each bin padded to TILE=16 so WMMA m-tiles align to single experts.
-2. Single-warp WMMA kernel: each block computes one 16×16 (N×M) output tile for one expert, decoding SCLP4 nibbles directly into the A fragment.
+**Diff harness** (`SCLP_FUSED_MOE_WMMA_DIFF=1`) compares fused vs two-pass output row by row. With the clean build, it shows the actual bug shape:
+- Fused output magnitude per output row is **3-8× too small** vs reference (e.g. ref `|sum|=801`, fused `|sum|=227`).
+- Not a constant factor — varies row by row (some rows show ~8× ratio).
+- All cells are non-zero with the right sign pattern; the kernel is computing something proportional but scaled down.
 
-Perf with env var on (Gemma4 MIXED-imatrix-1%): **pp512 = 2822 t/s vs 1699 two-pass vs 2937 Q5_K_M** — 1.66× speedup, matches the Q5_K_M ceiling. tg unchanged (different path). Confirms the fused architecture is the right approach.
+Likely suspects (revised):
+1. Sentinel-padded slots in the M tile are being included in the GEMM in some way that dilutes the real outputs — e.g. WMMA accumulator may still be receiving contributions from padded positions even though we mask after.
+2. Single-warp WMMA fragment packing differs subtly from the 4-warp SCLP8 reference — the lane-mirror layout may not give a single warp a complete D matrix to write back.
+3. Some K iterations might be silently producing zero A or B fragments.
 
-**Correctness bug**: PPL 259K vs 13.9K baseline on wikitext-test (3 chunks). Output is structurally non-random but quantitatively wrong.
-
-**Diff harness landed** (`SCLP_FUSED_MOE_WMMA_DIFF=1`) — runs both paths in the SCLP4 dispatch, D2H-copies outputs, prints per-slot stats. Reveals:
-- src1 ne=[2816, 1, 2, 1], ids ne=[128, 2] for Gemma4 (top-128 dense routing, src1 broadcast across slots — confirmed)
-- Fused outputs are plausible (avg |x|~0.4, max ~1.7, all 1408 cells nonzero)
-- **Two-pass reference dst reads as ALL ZEROS in diff mode** even though src1 is non-zero and the decoded BF16 weight buffer is populated. A sentinel 9999 at dst[0] gets overwritten to 0 by the recursive call. With harness disabled, the same two-pass path produces correct PPL=13.9K. Ruled out: pool aliasing (raw hipMalloc reproduces the same zero ref). The diff-harness vs production discrepancy is unexplained — possibly mul_mat_id+glu graph fusion decouples this dst from the recursive call's logical output.
-
-**Next debug step**: bypass D2H entirely with an on-device diff kernel (compute max-abs-diff per output row on GPU, copy only the stats back), or compute a CPU-side reference for one MoE call and compare. Either should sidestep the harness anomaly.
+Performance ceiling is now well-defined: 845 t/s is 29% of Q5_K_M (2937 t/s) — fused alone isn't enough to close the MoE prefill gap. A real ceiling would need WMMA + occupancy improvements (currently 1 warp/block, target 4-8) and possibly K-tile pipelining.
 
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
