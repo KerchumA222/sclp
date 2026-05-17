@@ -245,21 +245,29 @@ What survived from the earlier session:
 - The hipMemset stub *did* validly tell us decode work matters; the magnitude was just garbled. With the stub gone, vectorized SCLP4/SCLP6 stores still represent a real (small) win (~6% on Gemma4 prefill vs scalar stores).
 - Decode-vs-GEMM ratio in the two-pass path is no longer cleanly profiled; needs to be redone with `hipEventRecord` timers (not a global stub) when prioritized.
 
-### Fused SCLP4 MoE WMMA Prefill Kernel (WIP — real bug, not yet fixed)
+### Fused SCLP4 MoE WMMA Prefill Kernel (WIP, May 2026)
 
-The fused decode+GEMM MoE prefill kernel (`sclp4_fused_moe_wmma_kernel` + `sclp_moe_route_sort_kernel` in `sclp_bridge.cuh`, behind `SCLP_FUSED_MOE_WMMA=1`) does **+38% prefill** (615 → 845 t/s on Gemma4 MIXED) but PPL is catastrophically wrong (~10^8 vs 3469 baseline on wikitext-test 3 chunks).
+Three kernels in `sclp_bridge.cuh` make up the fused prefill path:
+1. `sclp4_fused_moe_wmma_kernel` — RDNA3 WMMA, fast but outputs 30% of correct magnitude (real bug — most likely single-warp fragment register packing differs from the 4-warp SCLP8 reference).
+2. `sclp4_fused_moe_scalar_kernel` — same routing/gather, scalar dot-products. 92% of correct magnitude without sidecar.
+3. `sclp4_moe_sidecar_correct_kernel` — post-hoc atomicAdd corrections for the ~1.9% sidecar weights. Scalar + sidecar reaches **bit-perfect** match to two-pass (max_abs 1e-5 across all 360K dst cells per call, verified via diff harness mode=2).
 
-**Diff harness** (`SCLP_FUSED_MOE_WMMA_DIFF=1`) compares fused vs two-pass output row by row. With the clean build, it shows the actual bug shape:
-- Fused output magnitude per output row is **3-8× too small** vs reference (e.g. ref `|sum|=801`, fused `|sum|=227`).
-- Not a constant factor — varies row by row (some rows show ~8× ratio).
-- All cells are non-zero with the right sign pattern; the kernel is computing something proportional but scaled down.
+Env-var matrix (all default off):
+- `SCLP_FUSED_MOE_WMMA=1` — fused only
+- `SCLP_FUSED_MOE_WMMA_DIFF=1` — fused into scratch + two-pass into dst + diff
+- `SCLP_FUSED_MOE_SCALAR=1` — use scalar kernel instead of WMMA
+- `SCLP_FUSED_MOE_NO_SIDECAR=1` — skip sidecar correction
 
-Likely suspects (revised):
-1. Sentinel-padded slots in the M tile are being included in the GEMM in some way that dilutes the real outputs — e.g. WMMA accumulator may still be receiving contributions from padded positions even though we mask after.
-2. Single-warp WMMA fragment packing differs subtly from the 4-warp SCLP8 reference — the lane-mirror layout may not give a single warp a complete D matrix to write back.
-3. Some K iterations might be silently producing zero A or B fragments.
+Perf (Gemma4 MIXED-imatrix-1%):
+| Path | pp512 t/s | notes |
+|---|---|---|
+| Two-pass (baseline) | 615 | correct, PPL=940 @ 50 chunks |
+| Fused WMMA + sidecar | 411 | WMMA broken, sidecar dominates |
+| Fused scalar + sidecar | 396 | math correct, sidecar dominates |
 
-Performance ceiling is now well-defined: 845 t/s is 29% of Q5_K_M (2937 t/s) — fused alone isn't enough to close the MoE prefill gap. A real ceiling would need WMMA + occupancy improvements (currently 1 warp/block, target 4-8) and possibly K-tile pipelining.
+The sidecar correction kernel currently dominates kernel time — for each sidecar weight it iterates over every routed slot in that expert's bin doing atomicAdd to dst. Needs restructuring (per-slot loop with shared-memory sidecar batch loading) before fused can beat baseline.
+
+**Unsolved PPL mystery** (documented inline in `sclp_bridge.cuh`): with scalar+sidecar in mode=1, dst values are bit-identical to two-pass per the in-dispatch diff diagnostic, yet end-to-end PPL is 22-40M instead of 940. Adding a no-op two-pass run after fused fixes PPL — suggesting the recursive `ggml_cuda_mul_mat_id` BF16 call has a side effect beyond writing dst that downstream depends on. Bisect that side effect next session.
 
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
