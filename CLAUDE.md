@@ -267,7 +267,13 @@ Perf (Gemma4 MIXED-imatrix-1%):
 
 The sidecar correction kernel currently dominates kernel time — for each sidecar weight it iterates over every routed slot in that expert's bin doing atomicAdd to dst. Needs restructuring (per-slot loop with shared-memory sidecar batch loading) before fused can beat baseline.
 
-**Unsolved PPL mystery** (documented inline in `sclp_bridge.cuh`): with scalar+sidecar in mode=1, dst values are bit-identical to two-pass per the in-dispatch diff diagnostic, yet end-to-end PPL is 22-40M instead of 940. Adding a no-op two-pass run after fused fixes PPL — suggesting the recursive `ggml_cuda_mul_mat_id` BF16 call has a side effect beyond writing dst that downstream depends on. Bisect that side effect next session.
+**PPL "mystery" resolved**: was a real numerical bug, not a mystery. Earlier diff sampling reported max_abs ~1e-5 but only looked at the first 16 rows. Running diff over the full 360K-cell dst shows max=0.005, mean=0.00065, 89% of cells with diff > 1e-4. That's ~0.5% per-cell drift, which compounds through 26 MoE FFN layers (with GLU multiplicative gating between gate-up and down) into catastrophic PPL.
+
+Definitive test via `SCLP_M2_OVERWRITE_FUSED=1` in DIFF mode: at end of dispatch, copy fused output onto dst. PPL drops from 1650 (baseline, dst=two-pass) to 10.6M (dst=fused). Same dst tensor — only difference is which path wrote.
+
+Source: rocBLAS BF16 GEMM accumulates in tensor-core tile order; our scalar loop accumulates sequentially. K=2816 F32-accumulated multiplications differ at ~1e-3 magnitudes between the two orders (non-associative F32 addition). Gemma4-IT is very sensitive to FFN-output noise at this scale.
+
+**Implication for the fused-MoE-prefill program**: closing the prefill perf gap via fused decode+GEMM requires either using rocBLAS for the GEMM (defeats fusion), exactly reproducing rocBLAS's tile+accumulation order (substantial WMMA tiling work), or recalibrating from BF16 (long shot). The naive "just write a fused kernel" path doesn't work for models sensitive to BF16-level numerical noise. Pivoting to other prefill optimizations is likely more productive.
 
 ### Bridge Architecture (`sclp_bridge.cuh`)
 
