@@ -232,14 +232,20 @@ tg wins because SCLP reads 8 bits/weight vs 16 for BF16. pp lags Q8_0 because th
 
 **Caution — earlier write-up was bogus** due to `-DSCLP_MEMSET_STUB=1` getting stuck in CMakeCache during profiling. The flag stubbed `llama_sclp{,4,6}_dispatch` to `hipMemsetAsync` (zero-fill BF16 weight buffer), making the rocBLAS GEMM produce all-zero output. Every subsequent build for ~a session ran with that stub on, inflating pp numbers to the memset-bandwidth ceiling and producing zero-output PPL that we mistook for "still close to baseline" because the *original* baseline measurements were also taken in that same session. The stub mechanism has now been removed entirely (see llama.cpp `b0306ab2c`).
 
-**Real numbers (clean build, gfx1100 RX 7900 XTX):**
+**Real numbers (clean build, gfx1100 RX 7900 XTX), AFTER decode kernel re-tiling (May 2026):**
 
 | Model | Config | pp512 t/s | tg t/s | vs reference |
 |---|---|---|---|---|
-| Llama-3-8B | SCLP4-kmeans-sc1 | 2574 | 25.5 | 78% of Q8_0's 3276 |
+| Llama-3-8B | SCLP4-kmeans-sc1 | ~2830 | 25.5 | 86% of Q8_0's 3276 |
 | Llama-3-8B | Q8_0 | 3276 | 81 | (reference) |
-| Gemma4 MoE | MIXED+imatrix 1%, two-pass | 615 | 55.4 | 21% of Q5_K_M's 2937 |
-| Gemma4 MoE | MIXED+imatrix 1%, fused WMMA on (broken) | 845 | 55.4 | +38% but PPL=10^8 |
+| Gemma4 MoE | MIXED+imatrix 1%, two-pass | **1210** | 55.4 | 41% of Q5_K_M's 2937 |
+
+The Gemma4 MoE prefill nearly doubled (615 → 1210 t/s, +97%) from three changes to the two-pass decode kernels:
+1. Sidecar fixup grid 4 blocks → 256 blocks (criminally underparallelized on 96 CUs)
+2. SCLP6 decode: 4 weights/thread → 32 weights/thread (was the biggest bottleneck — kernel was doing 4-8× more thread launches than SCLP4 per output byte)
+3. SCLP4 decode: 16 weights/thread → 32 weights/thread + cached per-block expert resolution (no per-thread divisions)
+
+All PPL-preserving (940 ± 55, 50 chunks).
 
 What survived from the earlier session:
 - The hipMemset stub *did* validly tell us decode work matters; the magnitude was just garbled. With the stub gone, vectorized SCLP4/SCLP6 stores still represent a real (small) win (~6% on Gemma4 prefill vs scalar stores).
