@@ -12,6 +12,9 @@ import argparse
 import struct
 import sys
 import os
+import tempfile
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
@@ -188,6 +191,42 @@ def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
     return blob
 
 
+def _encode_worker(prec: str, data_u16: np.ndarray, shape: list, sidecar_dist: int,
+                   importance: np.ndarray | None, sidecar_imatrix_budget: float,
+                   tmp_path: str) -> tuple:
+    """Worker: encode one tensor, write blob to tmp_path, return summary.
+
+    Returns (blob_size, sc_count, ws_offset, ws_len, ratio_numerator_nbytes).
+    """
+    if prec == 'sclp4':
+        blob = build_sclp4_blob(data_u16, shape=shape, sidecar_dist=sidecar_dist,
+                                importance=importance,
+                                sidecar_imatrix_budget=sidecar_imatrix_budget)
+        ws_len = (len(data_u16) + 1) // 2
+    elif prec == 'sclp6':
+        blob = build_sclp6_blob(data_u16, shape=shape, sidecar_dist=sidecar_dist,
+                                importance=importance,
+                                sidecar_imatrix_budget=sidecar_imatrix_budget)
+        ws_len = ((len(data_u16) + 3) // 4) * 3
+    else:  # sclp8
+        blob = build_sclp_blob(data_u16)
+        if len(blob) % 2 != 0:
+            blob += b'\x00'
+        ws_len = len(data_u16)
+
+    with open(tmp_path, 'wb') as f:
+        f.write(blob)
+
+    # Compute offsets from blob bytes
+    n_exp = struct.unpack_from('<I', blob, 4)[0]
+    pos = 8
+    for _ in range(n_exp):
+        pos += 1 + blob[pos]
+    ws_offset = pos
+    sc_count = struct.unpack_from('<I', blob, ws_offset + ws_len)[0]
+    return (len(blob), sc_count, ws_offset, ws_len)
+
+
 def copy_kv(writer: GGUFWriter, reader: GGUFReader) -> None:
     for key, field in reader.fields.items():
         if key.startswith('GGUF.'):
@@ -221,6 +260,10 @@ def main():
                              'activation importance can rescue extra high-impact weights into the sidecar — '
                              'controlled by --sidecar-imatrix-budget. (Imatrix is no longer applied to k-means '
                              'palette selection; that variant regressed PPL — see CLAUDE.md.)')
+    parser.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 4) // 2),
+                        metavar='N',
+                        help='Parallel encoding workers (default: cpu_count/2). '
+                             'Each worker holds one tensor in memory; tune down if RAM-bound.')
     parser.add_argument('--sidecar-imatrix-budget', type=float, default=0.0, metavar='FRAC',
                         help='When --imatrix is set, sidecar an additional FRAC fraction of each tensor\'s '
                              'weights ranked by importance × exponent_distance_to_palette. 0=off (default). '
@@ -263,109 +306,138 @@ def main():
     encodable_types = {GGMLQuantizationType.BF16, GGMLQuantizationType.F16, GGMLQuantizationType.F32}
 
     all_tensors = [t for r in readers for t in r.tensors]
-    for t in all_tensors:
-        shape = list(reversed(t.shape.tolist()))  # GGUF stores fastest-dim first
-        prec  = precision_for_tensor(t.name, args.format)
 
-        # If the source tensor is already quantized (e.g. Q4_K from a pre-quantize pass),
-        # we can't re-encode it — pass through verbatim. This lets the caller mix our
-        # SCLP types with stock k-quants by pre-quantizing specific tensors with
-        # llama-quantize --tensor-type before running this script.
+    # Precompute per-tensor plan so workers can be dispatched without re-deriving policy.
+    plans = []  # list of dicts: name, prec, shape, importance, encodable
+    for t in all_tensors:
+        shape = list(reversed(t.shape.tolist()))
+        prec  = precision_for_tensor(t.name, args.format)
         if prec != 'none' and t.tensor_type not in encodable_types:
             print(f"  passthru: {t.name} is {t.tensor_type.name} (not BF16/F16/F32) — copying verbatim")
             prec = 'none'
-
+        importance = None
+        if prec != 'none' and imatrix_data is not None:
+            entry = imatrix_data.get(t.name)
+            if entry is not None and entry['nval'] > 0:
+                K = int(shape[-1])
+                try:
+                    importance = per_column_importance(entry, K)
+                except ValueError as e:
+                    print(f"  ! imatrix shape mismatch for {t.name}: {e} — skipping importance")
+                    importance = None
+        plans.append({'shape': shape, 'prec': prec, 'importance': importance})
         per_format_counts[prec] += 1
 
-        if prec != 'none':
-            data = to_bf16_uint16(t.data, t.tensor_type)
-            # Pull per-tensor importance if imatrix is loaded and this tensor was observed.
-            importance = None
-            if imatrix_data is not None:
-                # imatrix tensor names use the same convention as ggml ('blk.X.foo.weight').
-                entry = imatrix_data.get(t.name)
-                if entry is not None and entry['nval'] > 0:
-                    # K = innermost dim (last entry in slowest-first shape list).
-                    K = int(shape[-1])
-                    try:
-                        importance = per_column_importance(entry, K)
-                    except ValueError as e:
-                        print(f"  ! imatrix shape mismatch for {t.name}: {e} — skipping importance")
-                        importance = None
-            if prec == 'sclp4':
-                blob = build_sclp4_blob(data, shape=shape, sidecar_dist=args.sidecar_dist,
-                                         importance=importance,
-                                         sidecar_imatrix_budget=args.sidecar_imatrix_budget)
-                gguf_dtype = GGMLQuantizationType.SCLP4
-                # Use int8 (not uint8) to bypass GGUFWriter's quant_shape_from_byte_shape
-                # which would incorrectly double the last dimension for blck_size=2 types.
-                np_blob = np.frombuffer(blob, dtype=np.int8).copy()
-                ws_len = (len(data) + 1) // 2
-            elif prec == 'sclp6':
-                blob = build_sclp6_blob(data, shape=shape, sidecar_dist=args.sidecar_dist,
-                                         importance=importance,
-                                         sidecar_imatrix_budget=args.sidecar_imatrix_budget)
-                gguf_dtype = GGMLQuantizationType.SCLP6
-                # Use int8 (not uint8) to bypass GGUFWriter's quant_shape_from_byte_shape
-                # which would incorrectly transform shape for blck_size=4 types.
-                np_blob = np.frombuffer(blob, dtype=np.int8).copy()
-                ws_len = ((len(data) + 3) // 4) * 3
-            else:  # sclp8
-                blob = build_sclp_blob(data)
-                gguf_dtype = GGMLQuantizationType.SCLP
-                # Pad to even byte count for uint16 view
-                if len(blob) % 2 != 0:
-                    blob += b'\x00'
-                np_blob = np.frombuffer(blob, dtype=np.uint16).copy()
-                ws_len = len(data)
+    n_sclp = sum(1 for p in plans if p['prec'] != 'none')
+    workers = max(1, min(args.workers, n_sclp)) if n_sclp else 1
+    print(f"Parallel encode: {workers} worker(s) for {n_sclp} SCLP tensors")
 
-            writer.add_tensor(t.name, np_blob,
-                              raw_shape=shape,
-                              raw_dtype=gguf_dtype)
+    # Worker tempdir lives next to the output so blob mmap reads stay on the same filesystem.
+    output_dir = os.path.dirname(os.path.abspath(args.output)) or '.'
+    tmpdir_ctx = tempfile.TemporaryDirectory(prefix='sclp_blobs_', dir=output_dir)
+    tmpdir = tmpdir_ctx.name
 
-            # Compute ws_offset from the multi-palette header
-            n_exp = struct.unpack_from('<I', blob, 4)[0]
-            pos = 8
-            for _ in range(n_exp):
-                pos += 1 + blob[pos]  # skip palette_size + palette bytes
-            ws_offset = pos
-            sc_count = struct.unpack_from('<I', blob, ws_offset + ws_len)[0]
-            ratio = t.n_bytes / len(blob)
-            total_original += t.n_bytes
-            total_compact  += len(blob)
-            total_sidecar  += sc_count
-            n_compressed   += 1
-            sc_note = f" ({sc_count} sidecar)" if sc_count else ""
-            print(f"  {prec.upper():>5} [{n_compressed:3d}] {t.name}: {ratio:.3f}x{sc_note}")
-        else:
-            # GGUFWriter expects shape semantics that differ by element type:
-            #   - F-types and BF16-as-uint16: pass element shape (fastest-first).
-            #   - K-quants (uint8 byte arrays): pass byte shape; writer recovers
-            #     element shape internally via quant_shape_from_byte_shape.
-            raw = t.data
-            if raw.dtype == np.uint8:
-                block_size, type_size = GGML_QUANT_SIZES[t.tensor_type]
-                if type_size == 2 and block_size == 1:
-                    # BF16 / F16 stored as uint8 — view as uint16 and use element shape.
-                    raw = raw.view(np.uint16)
+    # Bounded sliding window: at most `lookahead` SCLP futures in flight at any time.
+    # Keeps peak memory ~ lookahead × (input + blob) per worker.
+    lookahead = workers * 2
+    futures = {}  # tensor_idx -> Future
+
+    ctx = mp.get_context('spawn')  # avoid fork(): GGUF mmaps + reader state aren't fork-safe
+    ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx) if n_sclp else None
+
+    def submit_idx(i: int):
+        t = all_tensors[i]
+        p = plans[i]
+        if p['prec'] == 'none':
+            return
+        data = to_bf16_uint16(t.data, t.tensor_type)  # copy: mmap → owned uint16
+        tmp_path = os.path.join(tmpdir, f"{i:05d}.blob")
+        futures[i] = ex.submit(
+            _encode_worker, p['prec'], data, p['shape'],
+            args.sidecar_dist, p['importance'], args.sidecar_imatrix_budget, tmp_path
+        )
+
+    try:
+        # Prime the pipeline
+        for i in range(min(lookahead, len(all_tensors))):
+            submit_idx(i)
+
+        for i, t in enumerate(all_tensors):
+            p = plans[i]
+            prec = p['prec']
+            shape = p['shape']
+
+            if prec != 'none':
+                blob_size, sc_count, ws_offset, ws_len = futures.pop(i).result()
+                tmp_path = os.path.join(tmpdir, f"{i:05d}.blob")
+                if prec == 'sclp4':
+                    gguf_dtype = GGMLQuantizationType.SCLP4
+                    blob_dtype = np.int8
+                elif prec == 'sclp6':
+                    gguf_dtype = GGMLQuantizationType.SCLP6
+                    blob_dtype = np.int8
+                else:
+                    gguf_dtype = GGMLQuantizationType.SCLP
+                    blob_dtype = np.uint16
+
+                # mmap the worker's blob file. Copy to detach from the file so the
+                # tempdir can be cleaned up at the end; writer.add_tensor keeps refs.
+                if blob_dtype == np.uint16:
+                    assert blob_size % 2 == 0, "sclp8 blob must be uint16-aligned"
+                    np_blob = np.memmap(tmp_path, dtype=np.uint16, mode='r',
+                                        shape=(blob_size // 2,))
+                else:
+                    np_blob = np.memmap(tmp_path, dtype=np.int8, mode='r',
+                                        shape=(blob_size,))
+                np_blob = np.array(np_blob)  # detach from mmap (free to unlink tmp file)
+                os.unlink(tmp_path)
+
+                writer.add_tensor(t.name, np_blob,
+                                  raw_shape=shape,
+                                  raw_dtype=gguf_dtype)
+
+                ratio = t.n_bytes / blob_size
+                total_original += t.n_bytes
+                total_compact  += blob_size
+                total_sidecar  += sc_count
+                n_compressed   += 1
+                sc_note = f" ({sc_count} sidecar)" if sc_count else ""
+                print(f"  {prec.upper():>5} [{n_compressed:3d}] {t.name}: {ratio:.3f}x{sc_note}")
+            else:
+                # GGUFWriter expects shape semantics that differ by element type:
+                #   - F-types and BF16-as-uint16: pass element shape (fastest-first).
+                #   - K-quants (uint8 byte arrays): pass byte shape; writer recovers
+                #     element shape internally via quant_shape_from_byte_shape.
+                raw = t.data
+                if raw.dtype == np.uint8:
+                    block_size, type_size = GGML_QUANT_SIZES[t.tensor_type]
+                    if type_size == 2 and block_size == 1:
+                        raw = raw.view(np.uint16)
+                        writer.add_tensor(t.name, raw.copy(),
+                                          raw_shape=shape,
+                                          raw_dtype=t.tensor_type)
+                    else:
+                        writer.add_tensor(t.name, raw.copy(),
+                                          raw_shape=list(raw.shape),
+                                          raw_dtype=t.tensor_type)
+                else:
                     writer.add_tensor(t.name, raw.copy(),
                                       raw_shape=shape,
                                       raw_dtype=t.tensor_type)
-                else:
-                    # True K-quant passthrough. t.data.shape is already fastest-first byte
-                    # shape per the reader, which is exactly what the writer wants.
-                    writer.add_tensor(t.name, raw.copy(),
-                                      raw_shape=list(raw.shape),
-                                      raw_dtype=t.tensor_type)
-            else:
-                writer.add_tensor(t.name, raw.copy(),
-                                  raw_shape=shape,
-                                  raw_dtype=t.tensor_type)
 
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+            # Slide the window: submit the tensor `lookahead` ahead of the just-consumed one.
+            nxt = i + lookahead
+            if nxt < len(all_tensors):
+                submit_idx(nxt)
+
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True)
+        tmpdir_ctx.cleanup()
 
     if total_original > 0:
         orig_gb = total_original / (1024**3)
