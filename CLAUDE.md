@@ -383,6 +383,44 @@ To produce the hybrid: requires a patch to `llama-quantize` (which only honored 
 - **Per-tensor budget** — different tensors have different importance×distance distributions; uniform 1% may be suboptimal.
 - **Error-magnitude based sidecar** — rank by `importance × actual_error` rather than `importance × distance`.
 
+### OOD vs Wikitext PPL on Agentic Workloads (May 2026)
+
+Built an agentic-trace calibration + eval set from `Verdugie/opus-4.6-training-catalog` (conversation/coding/reasoning splits flattened to `USER:`/`ASSISTANT:` text). See `tests/prep_opus_trace.py`. Holdout: 150 conversations (~1.6 MB) for OOD PPL; calibration: 6,503 conversations (~21 MB) used for `llama-imatrix --chunks 200` on Q5_K_M (~5 min on RX 7900 XTX, 97-99% MoE expert coverage).
+
+PPL on the held-out agentic OOD set (50 chunks, `-c 512 -b 512 -fa on`):
+
+| Config | Size | imatrix source | OOD PPL |
+|---|---|---|---|
+| **MIXED-opus** (SCLP6+SCLP4, opus imatrix) ⭐ | 17.0 GiB | opus traces, 200 chunks | **26.6 ± 1.1** |
+| MIXED-imatrix (SCLP6+SCLP4, wiki imatrix) | 14.9 GiB | wikitext, 80 chunks | 39.2 ± 1.8 |
+| SCLP6-Q4K-opus (SCLP6+Q4K, opus imatrix) | 16.7 GiB | opus traces | 157.6 ± 8.7 |
+| SCLP6-Q4K (SCLP6+Q4K, wiki imatrix) | 15.8 GiB | wikitext | 161.6 ± 8.9 |
+
+**Key findings**:
+
+1. **Wikitext PPL was OOD-inflated by ~50×**. Same models drop from 940→39 (MIXED) and 8877→158 (Q4K hybrid) when measured on in-distribution agentic text. The wikitext numbers showed correct *ratios* between quants but absolute values were misleading.
+
+2. **Calibration domain matters for SCLP4 sidecar selection, barely for Q4_K**. Switching to opus-traces imatrix:
+   - MIXED model: −32% PPL (39.2 → 26.6). SCLP4+imatrix-sidecar picks different weights to rescue when calibrated on the target domain.
+   - Q4K hybrid: −2% PPL (161.6 → 157.6, within noise). Q4_K per-block scales are insensitive to per-column importance vs SCLP's direct top-k weight rescue.
+
+3. **SCLP4+imatrix-sidecar quality lead over Q4_K grows with calibration match**. With wiki-imatrix on both: 4.1× (39 vs 162). With opus-imatrix on both: **5.9× (27 vs 158)**.
+
+4. **Size increased with opus imatrix** (17.0 vs 14.9 GiB for MIXED): the opus importance distribution promotes more weights into sidecar at the same 0.01 budget. Net result is still a Pareto win — same speed, +2 GiB, but 32% lower PPL.
+
+**Recommendation**: For agentic/instruction-tuned use cases, calibrate imatrix on representative dialogue traces (not wikitext) when targeting SCLP4+imatrix-sidecar. Q4_K gate/up isn't worth it unless prefill-bound — costs 6× quality for +59% prefill.
+
+To rebuild MIXED-opus from BF16:
+```bash
+llama-quantize \
+  --imatrix /home/ajkerchum/poc/eval_data/gemma4-opus-imatrix.dat \
+  --tensor-type '^token_embd\.weight$=BF16' \
+  --tensor-type '^output\.weight$=BF16' \
+  --tensor-type '^blk\.[0-9]+\.attn_(q|k|v|output)\.weight$=SCLP6' \
+  --tensor-type '^blk\.[0-9]+\.ffn_down(_exps)?\.weight$=SCLP6' \
+  bf16-shard-00001-of-00002.gguf MIXED-opus.gguf SCLP4 8
+```
+
 ## Known Issues
 
 ### SCLP4 VRAM Allocation (Resolved on Llama-3, Pending on Gemma4)
