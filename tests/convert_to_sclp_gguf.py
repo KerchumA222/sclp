@@ -65,6 +65,17 @@ _MIXED_POLICY = [
     ('ffn_gate_up_exps.weight', 'sclp4'),
 ]
 
+_MIXED_Q4K_POLICY = [
+    # SCLP6 on attention + ffn_down; gate/up left as verbatim BF16 for
+    # subsequent llama-quantize Q4_K pass.
+    ('attn_q.weight',           'sclp6'),
+    ('attn_k.weight',           'sclp6'),
+    ('attn_v.weight',           'sclp6'),
+    ('attn_output.weight',      'sclp6'),
+    ('ffn_down.weight',         'sclp6'),
+    ('ffn_down_exps.weight',    'sclp6'),
+]
+
 
 def precision_for_tensor(name: str, default_format: str) -> str:
     """Return the SCLP variant ('sclp4'|'sclp6'|'sclp8') to use for a tensor name,
@@ -73,12 +84,24 @@ def precision_for_tensor(name: str, default_format: str) -> str:
     For uniform --format sclpN runs, every is_sclp_target tensor uses N and all
     others are copied. For --format mixed, attention + ffn_down go SCLP6 and
     ffn_gate/up go SCLP4 (token_embd, output, norms copied verbatim)."""
-    if default_format != 'mixed':
+    if default_format == 'mixed':
+        policy = _MIXED_POLICY
+    elif default_format == 'mixed-q4k':
+        policy = _MIXED_Q4K_POLICY
+    else:
         return default_format if is_sclp_target(name) else 'none'
-    for suffix, prec in _MIXED_POLICY:
+    for suffix, prec in policy:
         if name.endswith(suffix):
             return prec
     return 'none'
+
+
+def _f32_to_bf16_rne(f32: np.ndarray) -> np.ndarray:
+    """Convert F32 to BF16 using round-to-nearest-even (matches C++ float_to_bf16)."""
+    i = f32.view(np.uint32)
+    lsb = (i >> 16) & 1
+    bias = np.uint32(0x7FFF) + lsb
+    return ((i.astype(np.uint64) + bias.astype(np.uint64)) >> 16).astype(np.uint16)
 
 
 def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -> np.ndarray:
@@ -88,9 +111,9 @@ def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -
         return raw.view(np.uint16)
     if tensor_type == GGMLQuantizationType.F16:
         f32 = raw.view(np.float16).astype(np.float32)
-        return (f32.view(np.uint32) >> 16).astype(np.uint16)
+        return _f32_to_bf16_rne(f32)
     if tensor_type == GGMLQuantizationType.F32:
-        return (raw.view(np.float32).view(np.uint32) >> 16).astype(np.uint16)
+        return _f32_to_bf16_rne(raw.view(np.float32))
     raise ValueError(f"Unsupported source type for SCLP encoding: {tensor_type}")
 
 
@@ -198,10 +221,33 @@ def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
     return blob
 
 
-def _encode_worker(prec: str, data_u16: np.ndarray, shape: list, sidecar_dist: int,
+def _load_tensor_from_mmap(gguf_path: str, byte_offset: int, n_elements: int,
+                           tensor_type_val: int) -> np.ndarray:
+    """mmap a tensor directly from the GGUF file and convert to BF16 uint16."""
+    tt = GGMLQuantizationType(tensor_type_val)
+    if tt == GGMLQuantizationType.BF16:
+        mm = np.memmap(gguf_path, dtype=np.uint16, mode='r',
+                       offset=byte_offset, shape=(n_elements,))
+        return np.array(mm)
+    elif tt == GGMLQuantizationType.F16:
+        mm = np.memmap(gguf_path, dtype=np.float16, mode='r',
+                       offset=byte_offset, shape=(n_elements,))
+        f32 = np.array(mm, dtype=np.float32)
+        return (f32.view(np.uint32) >> 16).astype(np.uint16)
+    elif tt == GGMLQuantizationType.F32:
+        mm = np.memmap(gguf_path, dtype=np.float32, mode='r',
+                       offset=byte_offset, shape=(n_elements,))
+        return (np.array(mm).view(np.uint32) >> 16).astype(np.uint16)
+    else:
+        raise ValueError(f"Unsupported tensor type: {tt}")
+
+
+def _encode_worker(prec: str, gguf_path: str, byte_offset: int, n_elements: int,
+                   tensor_type_val: int, shape: list, sidecar_dist: int,
                    importance: np.ndarray | None, sidecar_imatrix_budget: float,
                    tmp_path: str, n_experts: int) -> tuple:
-    """Worker: encode one tensor, write blob to tmp_path, return summary."""
+    """Worker: mmap tensor from GGUF, encode, write blob to tmp_path, return summary."""
+    data_u16 = _load_tensor_from_mmap(gguf_path, byte_offset, n_elements, tensor_type_val)
     if prec == 'sclp4':
         blob = build_sclp4_blob(data_u16, shape=shape, sidecar_dist=sidecar_dist,
                                 importance=importance,
@@ -252,10 +298,14 @@ def main():
     parser.add_argument('--input',  required=True, nargs='+',
                         help='Input BF16/F16 GGUF file(s). For split GGUFs, pass all shards in order.')
     parser.add_argument('--output', default=None,  help='Output compact SCLP GGUF file')
-    parser.add_argument('--format', choices=['sclp8', 'sclp6', 'sclp4', 'mixed'], default='sclp8',
+    parser.add_argument('--format', choices=['sclp8', 'sclp6', 'sclp4', 'mixed', 'mixed-q4k'], default='sclp8',
                         help='Output quantization format. sclp8/6/4: uniform N-bit on every linear projection. '
-                             'mixed: per-tensor policy (attn_*+ffn_down* → SCLP6, ffn_gate/up* → SCLP4, '
-                             'token_embd/output/norms → verbatim BF16/F16).')
+                             'mixed: per-tensor policy (attn_*+ffn_down* → SCLP6, ffn_gate/up* → SCLP4). '
+                             'mixed-q4k: SCLP6 on attn+ffn_down (from --bf16-source), Q4_K gate/up copied verbatim from --input.')
+    parser.add_argument('--bf16-source', nargs='+', default=None, metavar='PATH',
+                        help='BF16/F16 GGUF shard(s) to read unquantized weights from. '
+                             'Required for --format mixed-q4k when --input is a quantized GGUF: '
+                             'tensors targeted for SCLP encoding are read from here.')
     parser.add_argument('--sidecar-dist', type=int, default=0, metavar='D',
                         help='SCLP4/6: store weights verbatim in sidecar if nearest palette exponent distance > D. '
                              '0=off (default). 1 recommended: fixes ~0.1%% of worst-case errors at <0.3%% size overhead.')
@@ -309,7 +359,24 @@ def main():
     # Tensor types we can encode (we read BF16 bit patterns; F16/F32 round through f32→bf16).
     encodable_types = {GGMLQuantizationType.BF16, GGMLQuantizationType.F16, GGMLQuantizationType.F32}
 
-    all_tensors = [t for r in readers for t in r.tensors]
+    # When --bf16-source is provided (for mixed-q4k), build a lookup so SCLP-targeted
+    # tensors can be encoded from unquantized weights even when --input is quantized.
+    bf16_lookup = {}  # tensor_name -> (gguf_path, data_offset, n_elements, tensor_type_val)
+    if args.bf16_source:
+        print(f"BF16 source: {args.bf16_source}")
+        bf16_readers = [GGUFReader(p, mode='r') for p in args.bf16_source]
+        for br, bp in zip(bf16_readers, args.bf16_source):
+            for bt in br.tensors:
+                bf16_lookup[bt.name] = (bp, bt.data_offset, int(np.prod(bt.shape)), int(bt.tensor_type))
+        print(f"  indexed {len(bf16_lookup)} tensors from BF16 source")
+        del bf16_readers  # close mmaps; workers will re-mmap individual tensors
+
+    all_tensors = []
+    tensor_gguf_path = []  # which file each tensor lives in
+    for r, path in zip(readers, args.input):
+        for t in r.tensors:
+            all_tensors.append(t)
+            tensor_gguf_path.append(path)
 
     # Precompute per-tensor plan so workers can be dispatched without re-deriving policy.
     plans = []  # list of dicts: name, prec, shape, importance, encodable
@@ -317,8 +384,11 @@ def main():
         shape = list(reversed(t.shape.tolist()))
         prec  = precision_for_tensor(t.name, args.format)
         if prec != 'none' and t.tensor_type not in encodable_types:
-            print(f"  passthru: {t.name} is {t.tensor_type.name} (not BF16/F16/F32) — copying verbatim")
-            prec = 'none'
+            if t.name in bf16_lookup:
+                pass  # will encode from BF16 source
+            else:
+                print(f"  passthru: {t.name} is {t.tensor_type.name} (not BF16/F16/F32) — copying verbatim")
+                prec = 'none'
 
         n_experts = 1
         if any(x in t.name for x in ['.ffn_gate_exps.', '.ffn_up_exps.', '.ffn_down_exps.', '.ffn_gate_up_exps.']):
@@ -361,10 +431,18 @@ def main():
         p = plans[i]
         if p['prec'] == 'none':
             return
-        data = to_bf16_uint16(t.data, t.tensor_type)  # copy: mmap → owned uint16
+        # Use BF16 source when the primary input isn't encodable (e.g. Q4_K_M input)
+        if t.tensor_type not in encodable_types and t.name in bf16_lookup:
+            gguf_path, byte_offset, n_elements, tensor_type_val = bf16_lookup[t.name]
+        else:
+            gguf_path = tensor_gguf_path[i]
+            n_elements = int(np.prod(t.shape))
+            byte_offset = t.data_offset
+            tensor_type_val = int(t.tensor_type)
         tmp_path = os.path.join(tmpdir, f"{i:05d}.blob")
         futures[i] = ex.submit(
-            _encode_worker, p['prec'], data, p['shape'],
+            _encode_worker, p['prec'], gguf_path, byte_offset, n_elements,
+            tensor_type_val, p['shape'],
             args.sidecar_dist, p['importance'], args.sidecar_imatrix_budget, tmp_path, p['n_experts']
         )
 
