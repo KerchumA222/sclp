@@ -81,10 +81,6 @@ Design highlights:
 
 **Why 8-bit?** 8-bit (2.0×) is the "sweet spot" for RDNA3 hardware. It allows for simple byte-aligned loads and maps cleanly to 16x16 matrix operations. Lower bit-widths (SCLP4/SCLP6) are supported via bit-packing but introduce additional unpacking overhead.
 
-### 4.4 Stage 4: SCLP5 (Draft) — Interleaved Bit-Planes
-
-To bridge the performance gap between SCLP4 (~1200 t/s) and SCLP6 (~1400 t/s) while supporting 32-entry palettes (reducing MoE sidecars), a 5-bit **Interleaved Bit-Plane** strategy is in draft. This format packs 32 weights into 20-byte blocks, allowing for coalesced 128-bit loads and efficient Bit Field Extract (BFE) decoding on RDNA3.
-
 ---
 
 ## 5. Mixture of Experts (MoE) Support

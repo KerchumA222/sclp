@@ -139,69 +139,14 @@ def decode_palette_6b(encoded_data: dict, num_weights: int = None) -> np.ndarray
     return weights
 
 
-def decode_palette_5b(encoded: dict, num_weights: int) -> np.ndarray:
-    """
-    Decode SCLP5 (5-bit interleaved bit-planes) back to BF16.
-    """
-    palette   = encoded['palette']
-    ws_stream = encoded['ws_stream']
-    sidecar   = encoded['sidecar']
-    n_experts = encoded.get('n_experts', 1)
-
-    # Pad expert_nw to multiple of 32 for bit-plane logic
-    expert_nw_padded = (num_weights // n_experts + 31) // 32 * 32
-    decoded = np.zeros(expert_nw_padded * n_experts, dtype=np.uint16)
-
-    for e in range(n_experts):
-        expert_pal = palette[e] if n_experts > 1 else palette
-        n_blocks = expert_nw_padded // 32
-        expert_ws  = ws_stream[e * n_blocks * 20 : (e + 1) * n_blocks * 20]
-        
-        for b_idx in range(n_blocks):
-            block_ws = expert_ws[b_idx*20 : (b_idx+1)*20]
-            indices = np.zeros(32, dtype=np.uint32)
-            
-            # Unpack 5 planes
-            for p in range(5):
-                plane_bytes = block_ws[p*4 : (p+1)*4]
-                if len(plane_bytes) < 4: continue
-                # Explicitly use little-endian for bit-plane reconstruction
-                plane = np.frombuffer(plane_bytes, dtype='<u4')[0]
-                for i in range(32):
-                    if (plane >> i) & 1:
-                        indices[i] |= (1 << p)
-            
-            # Reconstruction: Exponent from palette, Sign/Mantissa assumed 0
-            weights = (expert_pal[indices].astype(np.uint16) << 7)
-            decoded[e * expert_nw_padded + b_idx*32 : e * expert_nw_padded + (b_idx+1)*32] = weights
-
-    # Apply sidecar
-    if sidecar['indices'].size > 0:
-        decoded[sidecar['indices']] = sidecar['values']
-
-    return decoded[:num_weights]
-
 
 if __name__ == "__main__":
-    from src.compression.encoder import encode_palette, encode_palette_5b
+    from src.compression.encoder import encode_palette
     test_weights = np.array([0xC001, 0x4002, 0xE003, 0x2004, 0x6005, 0xC001, 0x4002, 0xE003, 0x2004, 0x6005], dtype=np.uint16)
-    
+
     print("Testing SCLP8 (n_experts=2)...")
     encoded = encode_palette(test_weights, n_experts=2)
     decoded = decode_palette(encoded, len(test_weights))
     print("Original: ", [hex(x) for x in test_weights])
     print("Decoded:  ", [hex(x) for x in decoded])
     print("SCLP8 MoE test passed!")
-
-    print("\nTesting SCLP5...")
-    encoded_5b = encode_palette_5b(test_weights)
-    decoded_5b = decode_palette_5b(encoded_5b, len(test_weights))
-    print("Original: ", [hex(x) for x in test_weights])
-    print("Decoded:  ", [hex(x) for x in decoded_5b])
-    
-    # SCLP8/4/6 are lossy (mantissa truncation). SCLP5 as implemented here is also lossy.
-    # We check if the exponents match.
-    test_exps = (test_weights >> 7) & 0xFF
-    decoded_exps = (decoded_5b >> 7) & 0xFF
-    assert np.all(test_exps == decoded_exps), "SCLP5 exponent round-trip failed"
-    print("SCLP5 test passed (exponents match)!")
