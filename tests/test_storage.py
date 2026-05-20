@@ -38,8 +38,7 @@ def test_end_to_end_storage():
     # 7. Verify metadata
     assert loaded_num_weights == num_weights, f"Weight count mismatch: {loaded_num_weights} != {num_weights}"
     assert np.array_equal(encoded_data['palette'], loaded_data['palette']), "Palette mismatch"
-    assert np.array_equal(encoded_data['packed_indices'], loaded_data['packed_indices']), "Indices mismatch"
-    assert np.array_equal(encoded_data['sm_stream'], loaded_data['sm_stream']), "SM stream mismatch"
+    assert np.array_equal(encoded_data['ws_stream'], loaded_data['ws_stream']), "WS stream mismatch"
 
     # 8. Final Decode and Verify bit-level reconstruction of the compressed parts
     decoded_bits = decode_palette(loaded_data, loaded_num_weights)
@@ -53,5 +52,5 @@ def test_end_to_end_storage():
 
     print("End-to-end storage integration test passed!")
 
-if __name__ == "__main_main__":
+if __name__ == "__main__":
     test_end_to_end_storage()

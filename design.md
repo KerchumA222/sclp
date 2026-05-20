@@ -66,19 +66,34 @@ Dropping the lowest 2–3 bits of the mantissa makes the mantissa stream more co
 - Combined with soft exponent clipping, total per-weight error remains small and bounded.
 - The mantissa is otherwise left structurally unchanged — no codebook or learned representation is used in v1.
 
-### 4.3 Stage 3: Fixed-Width 4-Bit Palette Encoding (Lossless)
+### 4.3 Stage 3: Fixed-Width 8-Bit Interleaved Encoding (Lossless-First)
 
-After clipping, the exponent distribution is highly concentrated. A palette of ≤8 (or up to 16) dominant exponent values is built per tensor. Each weight's exponent is replaced by a 4-bit index into this palette.
+After clipping, the exponent distribution is highly concentrated. A palette of ≤16 dominant exponent values is built per tensor. Each weight is encoded into a single 8-bit byte:
 
-- **Fixed-width encoding:** every index is exactly 4 bits regardless of value. This is the critical SIMT compatibility property — no variable-length bitstreams, no control-flow divergence, no lane stalls.
-- **Palette fits in registers:** 8–16 BF16 values = 16–32 bytes. Easily held in thread registers or a small LDS allocation, avoiding global memory lookups in the hot path.
-- Two 4-bit indices are packed per byte in the weight stream.
-- Sign and mantissa bytes are stored in a separate stream (or interleaved — layout is a tunable parameter determined by profiling for optimal coalescing on the target GPU).
-- Rows containing weights with exponents outside the palette ('outlier rows') are stored verbatim in BF16 as a sidecar. In v1 this is simplified further by soft clipping eliminating most outliers beforehand, potentially removing the need for a sidecar entirely at the cost of a small additional quality trade-off.
+- **High nibble (4 bits)**: Index into the 16-entry exponent palette.
+- **Low nibble (4 bits)**: Sign bit (1 bit) + Top 3 mantissa bits (3 bits).
 
-**Why not Huffman or ANS?** Both achieve better compression ratios than fixed-width palette encoding, but both produce variable-length output that causes SIMT divergence on GPU wavefronts. On AMD RDNA3 with 64-lane wavefronts, this divergence is more expensive than on NVIDIA. The palette approach sacrifices ~3–5% compression ratio for fully branchless, constant-time decode — the correct trade-off for consumer GPU inference.
+Design highlights:
+- **Fixed-width encoding:** every weight is exactly 8 bits. This is the critical SIMT compatibility property — no variable-length bitstreams, no control-flow divergence, no lane stalls.
+- **Palette fits in registers:** 16 BF16 values = 32 bytes. Easily held in thread registers or a small LDS allocation, avoiding global memory lookups in the hot path.
+- **Interleaved layout:** Palette index and sign/mantissa bits are co-located in the same byte. This halves L2 cache pressure and improves memory coalescing compared to separate index/SM streams.
+- **Sidecar rescue:** Weights with exponents outside the top-16 palette are stored verbatim in a sidecar section. A grid-parallel fixup kernel restores them exactly, making the scheme functionally lossless for the most important outliers.
 
-### 4.4 Selective Compression (MLP + Attention Weights)
+**Why 8-bit?** 8-bit (2.0×) is the "sweet spot" for RDNA3 hardware. It allows for simple byte-aligned loads and maps cleanly to 16x16 matrix operations. Lower bit-widths (SCLP4/SCLP6) are supported via bit-packing but introduce additional unpacking overhead.
+
+### 4.4 Stage 4: SCLP5 (Draft) — Interleaved Bit-Planes
+
+To bridge the performance gap between SCLP4 (~1200 t/s) and SCLP6 (~1400 t/s) while supporting 32-entry palettes (reducing MoE sidecars), a 5-bit **Interleaved Bit-Plane** strategy is in draft. This format packs 32 weights into 20-byte blocks, allowing for coalesced 128-bit loads and efficient Bit Field Extract (BFE) decoding on RDNA3.
+
+---
+
+## 5. Mixture of Experts (MoE) Support
+
+SCLP provides tiered support for MoE layers (e.g., DeepSeek, Mixtral):
+
+- **All types (SCLP4/6/8)**: Full **per-expert palette** support. Each expert weight matrix is encoded with its own optimized exponent palette. All types share the same blob header: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size, palette bytes]...[ws_stream][sidecar]`.
+
+### 5.1 Selective Compression (MLP + Attention Weights)
 
 Following Unweight's insight and empirical validation, compression is applied to the following weight matrices:
 
@@ -124,18 +139,14 @@ Per-weight decode operations inside `sclp_decode_blob_kernel` (fixed-width, bran
 
 **HIP graph capture constraint**: All header parsing must happen on-device. `hipMemcpyAsync D2H` and `hipStreamSynchronize` are forbidden during HIP graph stream capture (`GGML_HIP_GRAPHS=ON`) and cause `ROCm error: operation failed due to a previous error during capture`. Both kernels use shared-memory reads for all blob metadata — no host-side device reads, graph-safe.
 
-### 5.2 Fused Decode-GEMM (Research Path)
+### 5.2 Fused Decode-GEMV/GEMM (Implemented)
 
-To achieve maximum efficiency on consumer hardware (RDNA3), a Fused SCLP-GEMM approach remains the long-term research direction:
+To achieve maximum efficiency on consumer hardware (RDNA3), SCLP utilizes fused kernels that eliminate intermediate BF16 allocations:
 
-- **Option B: Fused Tiled-GEMM (Research):** Custom tiled-GEMM kernel where tiles of compressed SCLP data are loaded into Shared Memory (LDS), transcoded to BF16 on-the-fly in registers, and passed to hardware matrix cores (WMMA). Eliminates the intermediate BF16 pool allocation and the second pass over the data.
+- **Fused GEMV (M=1)**: `sclp_fused_gemv_kernel` transcodes SCLP weights directly into registers during the dot-product reduction. It uses an LDS-backed LUT for the palette to minimize ALU cost.
+- **Fused WMMA (M>1)**: `sclp_fused_wmma_kernel` (and its scalar equivalent) decodes SCLP weights on-the-fly and feeds them directly into RDNA3 WMMA matrix instructions. This eliminates the "double trip" to memory and the large scratch buffer required by the two-pass approach.
 
-**Research Plan:**
-1. ~~Develop a high-speed Transcoder Bridge kernel.~~ ✓ Done — bridge implemented in `sclp_bridge.cuh`
-2. If memory bandwidth remains the bottleneck, focus on maximizing bridge performance and reducing pool allocation overhead.
-3. If compute becomes the bottleneck, implement the Fused Tiled-GEMM using WMMA.
-
-The reconstruct-then-MFMA sequence is designed so that decode ALU instructions are issued during memory latency of the next tile load, keeping the matrix units fully fed.
+These kernels are designed so that decode ALU instructions are issued during memory latency of the next tile load, keeping the matrix units fully fed.
 
 ### 5.3 Target Architecture Details (RDNA3 Primary)
 
@@ -193,10 +204,9 @@ While the GPU computes layer N's GEMM, a separate HIP stream decodes layer N+1's
 
 | Metric | Expected Value |
 |---|---|
-| Exponent compression (lossless only, no clipping) | ~30% on exponent stream |
-| Exponent compression (with soft clipping, palette ≤8 values) | ~35–45% on exponent stream |
-| Overall model size reduction (MLP weights only, no mantissa truncation) | ~20–30% of total model size |
-| Overall model size reduction (MLP weights + mantissa truncation, 2 bits dropped) | ~25–35% of total model size |
+| Exponent compression (SCLP8, interleaved) | 50% (2.0x) on streams |
+| Exponent compression (with soft clipping, SCLP4) | 75% (4.0x) on streams |
+| Overall model size reduction (Llama-3-8B, SCLP8) | ~43% reduction (14.97 -> 8.47 GB) |
 | Quality loss vs. baseline BF16 | Expected substantially less than INT8 quantization. Bounded and predictable. |
 
 ---

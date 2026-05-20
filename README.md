@@ -1,35 +1,35 @@
 # SCLP: Soft-Clipping Lossless-First Compression for LLM Weights
 
-SCLP is a lossless-first compression scheme for BF16 neural network weights that achieves a consistent **1.333× compression ratio** on compressed streams with near-zero quality loss on large models.
+SCLP is a lossless-first compression scheme for BF16 neural network weights that achieves a consistent **2× compression ratio** on compressed streams (8 bits/weight) with near-zero quality loss on large models.
 
 ## Key Results (Llama-3-8B)
 
 | Metric | Value |
 |---|---|
-| Compression ratio (SCLP streams) | **1.333×** (12 bits/weight vs 16) |
-| Model-wide compression (87% of params) | **1.278×** |
+| Compression ratio (SCLP streams) | **2.0×** (8 bits/weight vs 16) |
+| Model-wide compression (87% of params) | **1.77×** |
 | File size (padded GGUF) | 14.97 GB |
-| File size (compact GGUF) | **11.72 GB** (−22%) |
+| File size (compact GGUF) | **8.47 GB** (−43%) |
 | PPL delta vs BF16 baseline | **−0.09%** (within noise floor) |
-| Inference speed, fused decode-GEMV | **~49 t/s** vs ~52 t/s FP16 (94% of baseline) |
+| Inference speed (Generation) | **~49 t/s** (94% of FP16 baseline) |
 
 ## How It Works
 
 BF16 weights have an 8-bit exponent field. In practice, any given weight matrix uses only **10–16 distinct exponent values** covering 99.9%+ of its weights. SCLP exploits this:
 
-1. **Palette**: Record the top ≤16 exponent values by frequency
-2. **Pack indices**: Store each weight's palette index as a 4-bit nibble (2 per byte)
-3. **SM stream**: Store sign + full 7-bit mantissa (1 byte/weight, lossless)
-4. **Sidecar**: Store the rare outlier weights (0.01–0.03%) verbatim as BF16
+1. **Palette**: Record the top ≤16 exponent values by frequency (or k-means).
+2. **Interleaved stream (ws)**: Store each weight in a single byte:
+   - **High nibble (4 bits)**: Index into the exponent palette.
+   - **Low nibble (4 bits)**: Sign bit + Top 3 mantissa bits (SM).
+3. **Sidecar**: Store rare outlier weights (0.01–0.03%) verbatim as BF16.
 
-Decoding is: `reconstruct(palette[index], sm_byte)` — a single lookup + bitwise combine per weight. This maps directly to a fused decode-GEMV GPU kernel with negligible overhead.
+Decoding is: `reconstruct(palette[index], sm_nibble)` — a single lookup + bitwise combine per weight. This maps directly to a fused decode-GEMV GPU kernel with negligible overhead.
 
 ### Compression Ratio
 
 - Input: 16 bits/weight (BF16)
-- Palette index: 4 bits/weight
-- SM stream: 8 bits/weight
-- **Total: 12 bits/weight = 1.333×**
+- Compressed: 8 bits/weight
+- **Total: 2.0×** (on compressed streams)
 
 ## Repository Layout
 

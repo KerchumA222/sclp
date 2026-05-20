@@ -6,29 +6,24 @@ class CompressedTensorStorage:
     """
     Binary storage format for compressed BF16 tensors.
 
-    VERSION 1 layout:
+    VERSION 3 layout (Interleaved):
       Magic (4B)  Version uint16  NumWeights uint32
-      PaletteSize uint8  Palette[N] uint8
-      IndicesLen uint32  PackedIndices[M] uint8
-      SMLen uint32  SMStream[L] uint8
-
-    VERSION 2 adds a sidecar for outlier weights whose exponents fall outside
-    the top-16 palette.  Appended after the SM stream:
+      PaletteSize uint8   Palette[N] uint8
+      WSStreamLen uint32  WSStream[NumWeights] uint8
       SidecarCount uint32
-      SidecarIndices[SidecarCount] uint32   (position in original weight array)
-      SidecarValues[SidecarCount]  uint16   (full BF16 bits, verbatim)
+      SidecarIndices[SidecarCount] uint32
+      SidecarValues[SidecarCount]  uint16
     """
     
     MAGIC = b'SCLP'
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self, filepath: str):
         self.filepath = filepath
 
     def save(self, encoded_data: dict, num_weights: int):
         palette = encoded_data['palette'].astype(np.uint8)
-        packed_indices = encoded_data['packed_indices'].astype(np.uint8)
-        sm_stream = encoded_data['sm_stream'].astype(np.uint8)
+        ws_stream = encoded_data['ws_stream'].astype(np.uint8)
         sidecar = encoded_data.get('sidecar', {'indices': np.array([], dtype=np.uint32),
                                                 'values':  np.array([], dtype=np.uint16)})
 
@@ -38,11 +33,9 @@ class CompressedTensorStorage:
             f.write(struct.pack('<I', num_weights))
             f.write(struct.pack('<B', len(palette)))
             f.write(palette.tobytes())
-            f.write(struct.pack('<I', len(packed_indices)))
-            f.write(packed_indices.tobytes())
-            f.write(struct.pack('<I', len(sm_stream)))
-            f.write(sm_stream.tobytes())
-            # VERSION 2: sidecar
+            f.write(struct.pack('<I', len(ws_stream)))
+            f.write(ws_stream.tobytes())
+            
             sc_indices = sidecar['indices'].astype(np.uint32)
             sc_values  = sidecar['values'].astype(np.uint16)
             f.write(struct.pack('<I', len(sc_indices)))
@@ -61,24 +54,33 @@ class CompressedTensorStorage:
 
             palette = np.frombuffer(f.read(palette_size), dtype=np.uint8).copy()
 
-            indices_len = struct.unpack('<I', f.read(4))[0]
-            packed_indices = np.frombuffer(f.read(indices_len), dtype=np.uint8).copy()
+            if version == 3:
+                ws_len = struct.unpack('<I', f.read(4))[0]
+                ws_stream = np.frombuffer(f.read(ws_len), dtype=np.uint8).copy()
+                packed_indices = None
+                sm_stream = None
+            else:
+                # Legacy Version 1/2
+                indices_len = struct.unpack('<I', f.read(4))[0]
+                packed_indices = np.frombuffer(f.read(indices_len), dtype=np.uint8).copy()
+                sm_len = struct.unpack('<I', f.read(4))[0]
+                sm_stream = np.frombuffer(f.read(sm_len), dtype=np.uint8).copy()
+                ws_stream = None
 
-            sm_len = struct.unpack('<I', f.read(4))[0]
-            sm_stream = np.frombuffer(f.read(sm_len), dtype=np.uint8).copy()
-
-            # VERSION 2: sidecar (outlier weights stored verbatim)
             sidecar = {'indices': np.array([], dtype=np.uint32),
                        'values':  np.array([], dtype=np.uint16)}
             if version >= 2:
-                sc_count = struct.unpack('<I', f.read(4))[0]
-                if sc_count > 0:
-                    sc_idx = np.frombuffer(f.read(sc_count * 4), dtype=np.uint32).copy()
-                    sc_val = np.frombuffer(f.read(sc_count * 2), dtype=np.uint16).copy()
-                    sidecar = {'indices': sc_idx, 'values': sc_val}
+                sc_count_bytes = f.read(4)
+                if sc_count_bytes:
+                    sc_count = struct.unpack('<I', sc_count_bytes)[0]
+                    if sc_count > 0:
+                        sc_idx = np.frombuffer(f.read(sc_count * 4), dtype=np.uint32).copy()
+                        sc_val = np.frombuffer(f.read(sc_count * 2), dtype=np.uint16).copy()
+                        sidecar = {'indices': sc_idx, 'values': sc_val}
 
             encoded_data = {
                 'palette':        palette,
+                'ws_stream':      ws_stream,
                 'packed_indices': packed_indices,
                 'sm_stream':      sm_stream,
                 'sidecar':        sidecar,

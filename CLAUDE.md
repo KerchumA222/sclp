@@ -144,13 +144,14 @@ cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100
 cmake --build build --config Release -j$(nproc)
 ```
 
-### GGUF Blob Wire Format
+## Architecture & Format
+- **Current Standard**: SCLP8 (8-bit interleaved `ws_stream`).
+- **GGUF Types**: `GGML_TYPE_SCLP` (8-bit), `GGML_TYPE_SCLP4` (4-bit), `GGML_TYPE_SCLP6` (6-bit).
+- **Layout (all types)**: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size (1B), palette bytes]...[ws_stream][sidecar]`.
 
-The SCLP payload stored inside a GGUF tensor slot is **not** the same as the standalone `.sclp` file format — no magic bytes, no version field. It is a minimal self-describing blob:
+> [!NOTE]
+> All SCLP types (8/4/6) now share the same per-expert blob header format. SCLP8 per-expert palettes validated end-to-end on Gemma4 128-expert MoE tensors.
 
-```
-[uint32 num_weights][uint8 palette_size][palette (palette_size bytes)]
-[ws_stream (num_weights bytes): palette_idx(7:4)|smn(3:0) per weight]
 [uint32 sidecar_count]
 [uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
 ```

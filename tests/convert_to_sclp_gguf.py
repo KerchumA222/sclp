@@ -94,18 +94,25 @@ def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -
     raise ValueError(f"Unsupported source type for SCLP encoding: {tensor_type}")
 
 
-def build_sclp_blob(data_u16: np.ndarray) -> bytes:
+def build_sclp_blob(data_u16: np.ndarray, n_experts: int = 1) -> bytes:
     """Encode uint16 BF16 weights into a compact SCLP (8-bit) blob (no zero-padding)."""
-    encoded = encode_palette(data_u16)
+    encoded = encode_palette(data_u16, n_experts=n_experts)
     num_weights     = len(data_u16)
-    palette         = encoded['palette'].astype(np.uint8)
     ws              = encoded['ws_stream'].astype(np.uint8)
     sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
     sidecar_values  = encoded['sidecar']['values'].astype(np.uint16)
 
+    palettes = encoded['palette']
+    if n_experts == 1:
+        palette_header = struct.pack('<B', len(palettes)) + palettes.astype(np.uint8).tobytes()
+    else:
+        palette_header = b""
+        for p in palettes:
+            palette_header += struct.pack('<B', len(p)) + p.astype(np.uint8).tobytes()
+
     blob = (
-        struct.pack('<IB', num_weights, len(palette))
-        + palette.tobytes()
+        struct.pack('<II', num_weights, n_experts)
+        + palette_header
         + ws.tobytes()
         + struct.pack('<I', len(sidecar_indices))
         + sidecar_indices.tobytes()
@@ -193,11 +200,8 @@ def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
 
 def _encode_worker(prec: str, data_u16: np.ndarray, shape: list, sidecar_dist: int,
                    importance: np.ndarray | None, sidecar_imatrix_budget: float,
-                   tmp_path: str) -> tuple:
-    """Worker: encode one tensor, write blob to tmp_path, return summary.
-
-    Returns (blob_size, sc_count, ws_offset, ws_len, ratio_numerator_nbytes).
-    """
+                   tmp_path: str, n_experts: int) -> tuple:
+    """Worker: encode one tensor, write blob to tmp_path, return summary."""
     if prec == 'sclp4':
         blob = build_sclp4_blob(data_u16, shape=shape, sidecar_dist=sidecar_dist,
                                 importance=importance,
@@ -209,7 +213,7 @@ def _encode_worker(prec: str, data_u16: np.ndarray, shape: list, sidecar_dist: i
                                 sidecar_imatrix_budget=sidecar_imatrix_budget)
         ws_len = ((len(data_u16) + 3) // 4) * 3
     else:  # sclp8
-        blob = build_sclp_blob(data_u16)
+        blob = build_sclp_blob(data_u16, n_experts=n_experts)
         if len(blob) % 2 != 0:
             blob += b'\x00'
         ws_len = len(data_u16)
@@ -315,6 +319,13 @@ def main():
         if prec != 'none' and t.tensor_type not in encodable_types:
             print(f"  passthru: {t.name} is {t.tensor_type.name} (not BF16/F16/F32) — copying verbatim")
             prec = 'none'
+
+        n_experts = 1
+        if any(x in t.name for x in ['.ffn_gate_exps.', '.ffn_up_exps.', '.ffn_down_exps.', '.ffn_gate_up_exps.']):
+            # For expert tensors, shape is [n_experts, rows, cols]
+            if len(shape) == 3:
+                n_experts = shape[0]
+        
         importance = None
         if prec != 'none' and imatrix_data is not None:
             entry = imatrix_data.get(t.name)
@@ -325,7 +336,7 @@ def main():
                 except ValueError as e:
                     print(f"  ! imatrix shape mismatch for {t.name}: {e} — skipping importance")
                     importance = None
-        plans.append({'shape': shape, 'prec': prec, 'importance': importance})
+        plans.append({'shape': shape, 'prec': prec, 'importance': importance, 'n_experts': n_experts})
         per_format_counts[prec] += 1
 
     n_sclp = sum(1 for p in plans if p['prec'] != 'none')
@@ -354,7 +365,7 @@ def main():
         tmp_path = os.path.join(tmpdir, f"{i:05d}.blob")
         futures[i] = ex.submit(
             _encode_worker, p['prec'], data, p['shape'],
-            args.sidecar_dist, p['importance'], args.sidecar_imatrix_budget, tmp_path
+            args.sidecar_dist, p['importance'], args.sidecar_imatrix_budget, tmp_path, p['n_experts']
         )
 
     try:
