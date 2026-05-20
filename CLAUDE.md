@@ -181,7 +181,31 @@ Edit the paths at the bottom of `patch_gguf_sclp.py` to choose input file, outpu
 
 **F16→BF16 conversion is required.** If the source GGUF stores weights as F16 (e.g. `Meta-Llama-3-8B.fp16.gguf`), the `to_bf16_uint16()` helper converts via a float32 intermediate before encoding. Passing raw F16 bits to the SCLP encoder produces garbage output — the encoder treats all bits as BF16 1-8-7 layout, but F16 has a 5-bit exponent and 10-bit mantissa (1-5-10).
 
-### Generating a Native SCLP GGUF (from HuggingFace)
+### llama-quantize SCLP Support (May 2026)
+
+`llama-quantize` now natively supports `SCLP`, `SCLP4`, `SCLP6` as quantization types and as `--tensor-type` overrides. See `/home/ajkerchum/llama.cpp/src/llama-sclp.{h,cpp}`. This replaces the two-step Python converter for most hybrid use cases.
+
+**Single-step hybrid (SCLP6 attn+ffn_down + Q4_K gate/up)**:
+```bash
+llama-quantize \
+  --imatrix /home/ajkerchum/poc/eval_data/gemma4-imatrix.dat \
+  --tensor-type '^token_embd\.weight$=BF16' \
+  --tensor-type '^output\.weight$=BF16' \
+  --tensor-type '^blk\.[0-9]+\.attn_(q|k|v|output)\.weight$=SCLP6' \
+  --tensor-type '^blk\.[0-9]+\.ffn_down(_exps)?\.weight$=SCLP6' \
+  bf16-input.gguf output.gguf Q4_K_M 8
+```
+
+**Gotchas (learned during integration)**:
+1. **Flags must come BEFORE positional args** (`tools/quantize/quantize.cpp:511`). Arguments after the input file are silently ignored.
+2. **`--tensor-type` uses `std::regex_search`** (substring match). Use `^...$` anchors to avoid `output.weight` matching `attn_output.weight`.
+3. **token_embd and output MUST be native types** (BF16 or a standard quant). SCLP types only handle MUL_MAT on the GPU backend — they can't go through GET_ROWS (embedding/output lookup), which crashes on CPU.
+4. **Last positional arg is `nthread`** — default is 1, use 8+ for parallel Q4_K row quantization. SCLP expert encoding has its own internal threading (uses `std::thread::hardware_concurrency()`).
+5. **Soft clipping is disabled by default** (`clip_threshold=0`). The Python encoder doesn't clip; the C++ default matches.
+
+**Implementation**: `llama_tensor_quantize_sclp()` in `src/llama-sclp.cpp` parallelizes per-expert encoding (one thread per expert up to hw concurrency). Quantization time on Gemma4-26B-A4B: ~220s with 8 threads + parallel experts, down from ~1230s single-threaded — **5.6× speedup**.
+
+### Generating a Native SCLP GGUF (from HuggingFace, Python)
 
 To convert a HuggingFace checkpoint directly to a full SCLP GGUF (all linear projections compressed):
 
@@ -319,14 +343,37 @@ Knee at 1%. The 2% point is marginally worse than 1% (within error bars — ±62
 
 ### vs Q4_K on gate/up (hybrid comparison)
 
-To isolate whether SCLP4 is the bottleneck in mixed, swapped the SCLP4-on-gate/up for Q4_K (same imatrix file used by llama-quantize):
+Two hybrid variants tested:
+
+**Python-generated SCLP6+Q4_K (old)** — generated via two-step process (BF16 → llama-quantize Q4_K → patch SCLP6 tensors), without the new C++ SCLP encoder's k-means/imatrix-sidecar logic for SCLP6 tensors:
 
 | Config | Size | PPL |
 |---|---|---|
 | **SCLP4 + imatrix-sidecar 1%** ⭐ | 17.5 GB | **940** |
-| SCLP6+Q4K hybrid + imatrix-sidecar 1% | 16.4 GB | 9,961 |
+| SCLP6+Q4K hybrid (old, no imatrix on SCLP6) | 16.4 GB | 9,961 |
 
-Q4_K is **10.6× worse PPL** at slightly smaller size despite having access to the same imatrix calibration. The win is from concentration of precision: Q4_K spreads ~4.5 bits uniformly across every weight via per-256-block scales, while SCLP4+imatrix-sidecar gives most weights ~4 bits but stores the top ~2% (ranked by activation × distance) *verbatim*. For Gemma4-IT's weight distribution — long-tailed in `importance × reconstruction_error` — surgical lossless rescue beats uniform scaling. The Q4_K route is *not* the right knob even though it's the obvious one to try.
+**C++ llama-quantize SCLP6+Q4_K (new, May 2026)** — single-step via patched `llama-quantize` with native SCLP types. Uses k-means palette + imatrix-sidecar 1% on the SCLP6 tensors. See "llama-quantize SCLP Support" below.
+
+llama-bench results on Gemma4-26B-A4B-IT (RX 7900 XTX, `-fa 1 -t 16`):
+
+| Config | Size | pp512 | tg128 |
+|---|---|---|---|
+| **MIXED-imatrix** (SCLP6 attn+ffn_down, SCLP4 gate/up) | 14.89 GiB | 1,137 | 64.5 |
+| **SCLP6+Q4K hybrid** (SCLP6 attn+ffn_down, Q4_K gate/up) | 15.80 GiB | **1,805** | **70.3** |
+
+The hybrid is **+59% prefill** and **+9% tg** at +0.9 GiB. Q4_K gate/up goes directly through rocBLAS INT8 — no two-pass SCLP decode for the bulk of weights.
+
+PPL comparison (wikitext-test, `-c 512 -b 512 --chunks 50 -fa on`):
+
+| Config | Size | PPL |
+|---|---|---|
+| **MIXED-imatrix** (SCLP6+SCLP4+imatrix-sidecar 1%) ⭐ | 14.9 GiB | **940** |
+| **SCLP6-Q4K hybrid** (C++ llama-quantize, imatrix-sidecar on SCLP6) | 15.8 GiB | 8,877 |
+| Old Python SCLP6+Q4K (no imatrix on SCLP6) | 16.4 GB | 9,961 |
+
+The C++ hybrid is marginally better than the old Python version (imatrix-sidecar on SCLP6 working as expected), but Q4_K gate/up costs **~9× PPL** vs SCLP4+imatrix-sidecar. The Q4_K route trades quality for prefill throughput — pick MIXED-imatrix for quality, SCLP6-Q4K for prefill-bound workloads.
+
+Q4_K is *not* a drop-in replacement for SCLP4 quality-wise (10.6× worse PPL on the old comparison), but for **attn+ffn_down=SCLP6 + gate/up=Q4_K** the speed win is significant. The right knob depends on workload (prefill vs decode bound).
 
 To produce the hybrid: requires a patch to `llama-quantize` (which only honored `--tensor-type` overrides when the default type was already quantized; now applies regardless — see `src/llama-quant.cpp`). Patch is local to this fork and worth upstreaming.
 
