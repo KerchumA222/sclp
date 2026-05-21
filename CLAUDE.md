@@ -444,6 +444,30 @@ Model loader stashes `disk_size` into `tensor->op_params[13:15]` (magic sentinel
 
 Even with exact alloc, a tensor whose SCLP4 blob exceeds its BF16 size is pathological — the converter should detect that case at encode time and fall back to BF16 (or SCLP6) for that specific tensor. This is the natural on-ramp to the mixed-precision idea above: instead of a hardcoded per-name policy, drive precision selection by measured per-tensor compression efficiency.
 
+## 16 GB VRAM Recipe (Gemma4-26B-A4B-IT, May 2026)
+
+For 16 GB cards (leaves ~1.4 GiB for KV cache + compute on a 24 GB target sliced down). Built with opus-traces imatrix.
+
+| Config | Size | OOD PPL |
+|---|---|---|
+| MIXED-opus-16gb (Q6_K embeds + SCLP6 attn+ffn_down + SCLP4 gate/up) | 16.2 GiB | 26.4 ± 1.1 |
+| **SCLP6attn-opus** (Q6_K embeds + SCLP6 attn only, SCLP4 ffn_down+gate/up) ⭐ | **14.6 GiB** | **40.0 ± 1.7** |
+| SCLP4-pure-opus (Q6_K embeds + SCLP4 everywhere) | 14.3 GiB | 97.1 ± 3.8 |
+
+**SCLP6attn-opus is the sweet spot for 16 GB**: 50% better PPL than pure SCLP4 at nearly the same size. Confirms design intuition — attention errors compound through softmax, so keeping `attn_(q|k|v|output)` at SCLP6 is highest-leverage; `ffn_down` errors absorb linearly into the residual stream and survive SCLP4.
+
+Build:
+```bash
+llama-quantize \
+  --imatrix /home/ajkerchum/poc/eval_data/gemma4-opus-imatrix.dat \
+  --tensor-type '^token_embd\.weight$=Q6_K' \
+  --tensor-type '^output\.weight$=Q6_K' \
+  --tensor-type '^blk\.[0-9]+\.attn_(q|k|v|output)\.weight$=SCLP6' \
+  bf16-shard-00001-of-00002.gguf SCLP6attn-opus.gguf SCLP4 8
+```
+
+Q6_K embeddings save ~0.8 GiB vs BF16 with no measurable PPL impact.
+
 ## Future Work: TurboQuant for KV Cache
 
 Orthogonal compression for KV cache (per-token rotation + low-bit quantization). Find community fork via upstream issue tracker. Integration: cherry-pick onto `sclp` branch, smoke-test Llama-3-8B, then layer onto weights. Expect rebase friction on KV cache type/node changes in ggml.
