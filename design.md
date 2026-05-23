@@ -105,7 +105,7 @@ Following Unweight's insight and empirical validation, compression is applied to
 
 Rationale: MLP and Attention projections constitute roughly 90% of total model parameters (67.8% in OPT-125m) and dominate memory traffic during token generation. Embeddings and layer norms are left uncompressed due to their higher sensitivity and smaller footprint.
 
-### 4.5 Optional: Combination with INT8 Quantization
+### 4.4 Optional: Combination with INT8 Quantization
 
 The pipeline can be preceded by INT8 quantization. In this case the palette operates on full 8-bit integer values rather than BF16 exponents — the 16 most common INT8 values are stored in the codebook and each weight is replaced by a 4-bit index. The combination makes most sense at INT8; at INT4 the quantization has already consumed most compressible entropy and the palette adds marginal value. Error from quantization and clipping accumulates in the residual stream and must be validated empirically rather than assumed to be additive.
 
@@ -113,11 +113,11 @@ A learned codebook (k-means / vector quantization) is a natural upgrade over the
 
 ---
 
-## 5. GPU Inference Kernel
+## 6. GPU Inference Kernel
 
-### 5.1 Transcoder Bridge (Implemented — llama.cpp Integration)
+### 6.1 Transcoder Bridge (Implemented — llama.cpp Integration)
 
-The Transcoder Bridge approach is implemented and working end-to-end in the llama.cpp `sclp` branch on RX 7900 XTX (gfx1100). All 224 linear projections of Llama 3 8B are compressed. Observed: ~16 t/s compressed / ~52 t/s FP16 baseline. The 3x overhead is expected for the bridge (extra decode + memory pass per matmul) and will be eliminated by the fused decode-GEMM path.
+The Transcoder Bridge approach is implemented and working end-to-end in the llama.cpp `sclp` branch on RX 7900 XTX (gfx1100). All 224 linear projections of Llama 3 8B are compressed. The two-pass path (decode blob → BF16 buffer → rocBLAS GEMM) is the fallback for large-M prefill. For single-token generation, fused decode-GEMV kernels eliminate the intermediate buffer entirely (~66 t/s SCLP vs ~52 t/s BF16 on Llama-3-8B).
 
 **Architecture:**
 - `sclp_bridge.cuh` contains two on-device kernels and a dispatch function:
@@ -135,7 +135,7 @@ Per-weight decode operations inside `sclp_decode_blob_kernel` (fixed-width, bran
 
 **HIP graph capture constraint**: All header parsing must happen on-device. `hipMemcpyAsync D2H` and `hipStreamSynchronize` are forbidden during HIP graph stream capture (`GGML_HIP_GRAPHS=ON`) and cause `ROCm error: operation failed due to a previous error during capture`. Both kernels use shared-memory reads for all blob metadata — no host-side device reads, graph-safe.
 
-### 5.2 Fused Decode-GEMV/GEMM (Implemented)
+### 6.2 Fused Decode-GEMV/GEMM (Implemented)
 
 To achieve maximum efficiency on consumer hardware (RDNA3), SCLP utilizes fused kernels that eliminate intermediate BF16 allocations:
 
@@ -144,7 +144,7 @@ To achieve maximum efficiency on consumer hardware (RDNA3), SCLP utilizes fused 
 
 These kernels are designed so that decode ALU instructions are issued during memory latency of the next tile load, keeping the matrix units fully fed.
 
-### 5.3 Target Architecture Details (RDNA3 Primary)
+### 6.3 Target Architecture Details (RDNA3 Primary)
 
 | Property | AMD RDNA3 | AMD CDNA3 (MI300X) | NVIDIA Ada (RTX 4090) | Apple M-series |
 |---|---|---|---|---|
@@ -156,7 +156,7 @@ These kernels are designed so that decode ALU instructions are issued during mem
 
 **Note on INT8 compute:** INT8 and BF16 MFMA use the same physical Matrix Core hardware on RDNA3, reconfigured per instruction. INT8 is ~2x faster in raw throughput but the advantage only materialises when the workload is compute-bound. Consumer single-user inference at batch size 1 is memory-bandwidth-bound, so the INT8 throughput advantage is largely irrelevant in that regime. The primary benefit of INT8 in this system is smaller weights (fewer bytes loaded from VRAM), not faster arithmetic.
 
-### 5.4 Known Kernel Bottlenecks
+### 6.4 Known Kernel Bottlenecks
 
 | Bottleneck | Detail and Mitigation |
 |---|---|
@@ -168,9 +168,9 @@ These kernels are designed so that decode ALU instructions are issued during mem
 
 ---
 
-## 6. Small Batch Size Mitigation Strategy
+## 7. Small Batch Size Mitigation Strategy
 
-### 6.1 Autotuner with Fallback Path
+### 7.1 Autotuner with Fallback Path
 
 At load time, a lightweight autotuner measures end-to-end throughput for two execution paths per layer:
 - **Path A (fused):** decode-GEMM kernel with palette lookup fused into matrix multiply
@@ -178,7 +178,7 @@ At load time, a lightweight autotuner measures end-to-end throughput for two exe
 
 The crossover batch size is hardware- and layer-specific. The autotuner result is cached as a per-model config file. At inference time, the runtime performs a single lookup to select the correct path per layer.
 
-### 6.2 Speculative Decoding
+### 7.2 Speculative Decoding
 
 Self-speculative decoding converts effective batch size 1 into batch size K from the base model's perspective, without requiring a separate smaller model. The base model weights are always frozen — compression applies without retraining interaction.
 
@@ -188,7 +188,7 @@ Self-speculative decoding converts effective batch size 1 into batch size K from
 | Medusa | Multiple small MLP heads attached to base model's final hidden state. Simpler training, lower acceptance. |
 | Lookahead decoding | Training-free. Maintains n-gram cache from previous context. Zero extra parameters. |
 
-### 6.3 Layer Pipelining (Decode-Ahead)
+### 7.3 Layer Pipelining (Decode-Ahead)
 
 While the GPU computes layer N's GEMM, a separate HIP stream decodes layer N+1's weights into a staging buffer. Double-buffering ensures decode output is never overwritten while still being consumed.
 
@@ -196,18 +196,21 @@ While the GPU computes layer N's GEMM, a separate HIP stream decodes layer N+1's
 
 ## 					
 
-## 7. Expected Compression Ratios and Quality
+## 8. Expected Compression Ratios and Quality
 
-| Metric | Expected Value |
+| Metric | Measured Value |
 |---|---|
-| Exponent compression (SCLP8, interleaved) | 50% (2.0x) on streams |
-| Exponent compression (with soft clipping, SCLP4) | 75% (4.0x) on streams |
-| Overall model size reduction (Llama-3-8B, SCLP8) | ~43% reduction (14.97 -> 8.47 GB) |
-| Quality loss vs. baseline BF16 | Expected substantially less than INT8 quantization. Bounded and predictable. |
+| SCLP8 compression (interleaved ws_stream) | 2.0× on streams (8 bits/weight) |
+| SCLP4 compression | 4.0× on streams (4 bits/weight) |
+| Model size (Llama-3-8B, SCLP8 compact) | 8.47 GB (vs 14.97 GB BF16, −43%) |
+| Model size (Gemma4-26B, mixed SCLP6+SCLP4) | 17.0 GiB (vs 48 GB BF16) |
+| Quality (Llama-3-8B SCLP8) | PPL 9.87 vs 10.59 BF16 (improved, likely from mantissa truncation regularization) |
+| Quality (Gemma4 mixed, OOD agentic) | PPL 26.6 (vs 18,481 Q5_K_M on wikitext) |
+| Generation speed (Llama-3-8B SCLP8) | ~66 t/s vs ~52 t/s BF16 (27% faster, reads half the bytes) |
 
 ---
 
-## 8. Key Risks and Open Questions
+## 9. Key Risks and Open Questions
 
 - **Clipping Sensitivity:** Per-layer clipping sensitivity is theoretically bounded but empirically unknown for specific models.
 - **RDNA3 MFMA occupancy:** The combined LDS requirements of the palette buffer and MFMA tile buffers may force lower wavefront occupancy than expected.
@@ -217,7 +220,7 @@ While the GPU computes layer N's GEMM, a separate HIP stream decodes layer N+1's
 
 ---
 
-## 9. Key Dependencies and References
+## 10. Key Dependencies and References
 
 | Item | Detail |
 |---|---|

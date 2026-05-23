@@ -3,7 +3,7 @@
 Convert a BF16/F16/F32 GGUF to a compact SCLP GGUF in a single pass.
 
 Linear projection tensors are encoded with SCLP and written at their actual
-compressed size (no zero-padding). All other tensors are copied verbatim.
+compressed size (compact format). All other tensors are copied verbatim.
 
 Usage:
     python3 tests/convert_to_sclp_gguf.py --input model.bf16.gguf --output model.sclp.gguf
@@ -118,7 +118,7 @@ def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -
 
 
 def build_sclp_blob(data_u16: np.ndarray, n_experts: int = 1) -> bytes:
-    """Encode uint16 BF16 weights into a compact SCLP (8-bit) blob (no zero-padding)."""
+    """Encode uint16 BF16 weights into a compact SCLP (8-bit) blob (compact format)."""
     encoded = encode_palette(data_u16, n_experts=n_experts)
     num_weights     = len(data_u16)
     ws              = encoded['ws_stream'].astype(np.uint8)
@@ -147,7 +147,7 @@ def build_sclp_blob(data_u16: np.ndarray, n_experts: int = 1) -> bytes:
 def build_sclp4_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int = 0,
                      importance: np.ndarray | None = None,
                      sidecar_imatrix_budget: float = 0.0) -> bytes:
-    """Encode uint16 BF16 weights into a compact SCLP4 (4-bit) blob (no zero-padding).
+    """Encode uint16 BF16 weights into a compact SCLP4 (4-bit) blob (compact format).
 
     For MoE tensors with shape [n_experts, N, K] (slowest-first after GGUF reversal),
     each expert gets its own palette.
@@ -186,7 +186,7 @@ def build_sclp4_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
 def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int = 0,
                      importance: np.ndarray | None = None,
                      sidecar_imatrix_budget: float = 0.0) -> bytes:
-    """Encode uint16 BF16 weights into a compact SCLP6 (6-bit) blob (no zero-padding).
+    """Encode uint16 BF16 weights into a compact SCLP6 (6-bit) blob (compact format).
 
     For MoE tensors with shape [n_experts, N, K] (slowest-first after GGUF reversal),
     each expert gets its own palette.

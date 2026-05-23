@@ -90,7 +90,7 @@ This confirms the palette compression assumption: a 16-entry palette captures vi
 
 **Operating point: threshold=125** — 1.333× MLP compression, +5.60% PPL vs. BF16 baseline.
 
-## 7. Attention Layer Compression (OPT-125m)
+## 8. Attention Layer Compression (OPT-125m)
 
 Evaluated the impact of adding attention layers (Q, K, V, O) to the compression pipeline at threshold=125.
 
@@ -103,7 +103,7 @@ Evaluated the impact of adding attention layers (Q, K, V, O) to the compression 
 
 > **Finding:** Attention layers are significantly less sensitive to exponent clipping than MLP layers. Adding them to the compression pipeline improves model-wide compression by 6.8% with minimal additional quality loss (+0.45% ΔPPL vs MLP-only).
 
-## 8. Llama-3-8B Scaling Results
+## 9. Llama-3-8B Scaling Results
 
 Evaluated SCLP on `unsloth/llama-3-8b` (BF16) using a subset of WikiText-2. All MLP and Attention linear layers (86.9% of model parameters) were compressed.
 
@@ -115,7 +115,7 @@ Evaluated SCLP on `unsloth/llama-3-8b` (BF16) using a subset of WikiText-2. All 
 
 > **Finding:** Llama-3-8B shows the same critical threshold behavior as OPT-125m. At threshold=125, we achieve near-lossless compression (ΔPPL within noise floor) while compressing 87% of the model to 8 bits/weight (SCLP8). The slight negative ΔPPL is likely due to the small sample size (10 samples) and stochastic rounding effects.
 
-## 9. GPU Throughput Benchmarks (ROCm)
+## 10. GPU Throughput Benchmarks (ROCm)
 
 Evaluated the `decode` kernel performance on a large weight matrix (500M weights, 1GB BF16).
 
@@ -126,7 +126,7 @@ Evaluated the `decode` kernel performance on a large weight matrix (500M weights
 
 > **Analysis:** The vectorized SCLP decoder achieves **near-theoretical maximum speedup** (2.0x). By processing two weights per thread and using LDS for the palette, we successfully hide the decoding compute overhead behind memory latency. The effective bandwidth of 2.35 GB/s represents the processing speed relative to original BF16 weights.
 
-## 10. Fused Decode-GEMV Kernel Optimization (RX 7900 XTX, gfx1100)
+## 11. Fused Decode-GEMV Kernel Optimization (RX 7900 XTX, gfx1100)
 
 Iterative optimization of the fused SCLP decode-GEMV kernel (M=1 single-token inference path).
 Baseline: two-pass decode-to-buffer → rocBLAS GEMM.
@@ -148,7 +148,7 @@ Baseline: two-pass decode-to-buffer → rocBLAS GEMM.
 > unpacking). Closing it further requires a fundamentally different approach such as a
 > 256-entry precomputed lookup table mapping packed bytes directly to BF16 pairs.
 
-## 11. Future Metrics
+## 12. Future Metrics
 - [ ] Full threshold sweep: Stage A at all thresholds (117–125), Stage C at 122–123.
 - [ ] Throughput (GB/s) benchmarks on RDNA3 hardware (RX 7900 XTX, gfx1100).
 - [ ] PPL delta on Llama-3-70B.
@@ -157,7 +157,7 @@ Baseline: two-pass decode-to-buffer → rocBLAS GEMM.
 - [x] Scaling validation on Llama-3-8B.
 - [x] GPU Throughput validation (Vectorized Decoder).
 
-## 11. Selective Sidecar Removal — PPL vs Quality Trade-off (Llama-3-8B, 2026-05-02)
+## 13. Selective Sidecar Removal — PPL vs Quality Trade-off (Llama-3-8B, 2026-05-02)
 
 *Methodology: sidecar entries ranked by drop_cost = MAE × sidecar_count per tensor.*
 *PPL measured with llama-perplexity on WikiText-2 test set (~10K tokens), ctx=2048.*
@@ -194,7 +194,7 @@ Baseline: two-pass decode-to-buffer → rocBLAS GEMM.
 | SCLP two-pass (decode → GEMM) | ~16 |
 | SCLP fused decode-GEMV | ~49 |
 
-## 12. Compact GGUF Format — Disk Savings (Llama-3-8B, 2026-05-06)
+## 14. Compact GGUF Format — Disk Savings (Llama-3-8B, 2026-05-06)
 
 *Tool: `tests/repack_sclp_gguf.py`. Input: padded SCLP GGUF. Hardware: AMD RX 7900 XTX.*
 
@@ -210,7 +210,9 @@ The padded SCLP GGUF format allocates `num_weights * 2` bytes per tensor slot (m
 
 The compact format is fully supported by the modified loader — inference verified correct at ~46 t/s on the compact file (identical output to padded format). The SCLP decode kernel self-parses the blob header on-device so it is unaffected by the change in on-disk allocation.
 
-## 13. Task Accuracy: Llama-3-8B Variants (0-shot, lm-evaluation-harness, 2026-05-08)
+## 15. Task Accuracy: Llama-3-8B Variants (0-shot, lm-evaluation-harness, 2026-05-08)
+
+> **Note:** §15–17 used an earlier SCLP GGUF with separate packed+sm streams (11.72 GB). The current ws_stream interleaved format (§14) produces 8.47 GB compact files. Speed and quality results here are from the older format but remain directionally valid.
 
 *Hardware: AMD RX 7900 XTX (gfx1100) · GGML_HIP=ON · ngl=99 · ctx=16384*
 *Evaluation: lm-evaluation-harness via local-completions backend, 100 examples per task.*
@@ -224,7 +226,7 @@ The compact format is fully supported by the modified loader — inference verif
 
 **Key finding:** SCLP compact (11.72 GB, 1.277× compression) scores within 1–5% of the BF16 baseline on all tasks. The small deltas are within expected noise for 100-example evaluation. SCLP retains full task accuracy while saving 3.28 GB (21.9%) over BF16.
 
-## 14. Perplexity and Speed: Llama-3-8B Variants (2026-05-08)
+## 16. Perplexity and Speed: Llama-3-8B Variants (2026-05-08)
 
 *Hardware: AMD RX 7900 XTX (gfx1100) · GGML_HIP=ON · ngl=99*
 *PPL: llama-perplexity on WikiText-2, ctx=512 (standard window).*
@@ -245,9 +247,8 @@ The compact format is fully supported by the modified loader — inference verif
 3. **Prompt speed slower (79% of BF16):** 2517 vs 3182 t/s — the prefill path still uses the two-pass decode (decode-to-buffer → matrix multiply). No fused prefill kernel exists yet; this is the next optimization target.
 
 4. **Q8 generation advantage:** 82.3 t/s reflects integer arithmetic throughput; Q8 fits the model in less VRAM, reducing memory bandwidth pressure during generation.
-4. **Q8 generation advantage:** 82.3 t/s reflects integer arithmetic throughput; Q8 fits the model in less VRAM, reducing memory bandwidth pressure during generation.
 
-## 15. Fused Prefill GEMM + Sidecar Correction (2026-05-08)
+## 17. Fused Prefill GEMM + Sidecar Correction (2026-05-08)
 
 *Hardware: AMD RX 7900 XTX (gfx1100) · GGML_HIP=ON · ngl=99*
 *Model: Llama-3-8B-SCLP-Patched.gguf (padded format, 14.96 GiB)*
