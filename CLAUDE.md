@@ -147,16 +147,21 @@ cmake --build build --config Release -j$(nproc)
 ## Architecture & Format
 - **Current Standard**: SCLP8 (8-bit interleaved `ws_stream`).
 - **GGUF Types**: `GGML_TYPE_SCLP` (8-bit), `GGML_TYPE_SCLP4` (4-bit), `GGML_TYPE_SCLP6` (6-bit).
-- **Layout (all types)**: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size (1B), palette bytes]...[ws_stream][sidecar]`.
+- **Layout (all types, with per-block scaling)**: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size (1B), palette bytes]...[scales (BF16, ceil(N/32) per expert)][ws_stream][sidecar]`.
 
 > [!NOTE]
-> All SCLP types (8/4/6) now share the same per-expert blob header format. SCLP8 per-expert palettes validated end-to-end on Gemma4 128-expert MoE tensors.
+> All SCLP types (8/4/6) now share the same per-expert blob header format with per-block scaling (`QK_SCLP=32`). Scales are stored as BF16 (not FP16) to match the GPU kernels' `__hip_bfloat16` reinterpret. Sidecar values are stored as raw BF16 of the original unscaled weight — sidecar fixup writes them directly, bypassing scale multiplication.
 
+```
+[uint32 num_weights][uint32 n_experts]
+[per-expert: uint8 palette_size, uint8[] palette] ...
+[BF16 scales: ceil(expert_nw / 32) per expert, all experts contiguous]
+[ws_stream]
 [uint32 sidecar_count]
 [uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
 ```
 
-`ws_stream` is exactly `num_weights` bytes — both the palette index and SM nibble for each weight are co-located in a single byte. The sidecar base is always at `ws + num_weights`.
+`ws_stream` is exactly `num_weights` bytes for SCLP8, `ceil(num_weights/2)` for SCLP4, `ceil(num_weights/4)*3` for SCLP6. The sidecar base follows immediately after the ws_stream.
 
 Weights whose exponents fall outside the top-16 palette are stored verbatim in the sidecar section and restored exactly by `sclp_fixup_sidecar_kernel` after the main decode. The sidecar is typically 0.01–0.03% of all weights (lossless).
 
@@ -449,6 +454,49 @@ llama-quantize \
 
 Q6_K embeddings save ~0.8 GiB vs BF16 with no measurable PPL impact.
 
+## Per-Block Scaling (May 2026)
+
+**Status:** Implemented on `sclp-turboquant` branch. Working for SCLP6 and SCLP8. **Not compatible with SCLP4** — see below.
+
+Per-block scaling adds a BF16 scale factor for every `QK_SCLP=32` weights. The encoder normalizes each block by its max absolute value before BF16 conversion and palette encoding, then the decoder multiplies by the stored scale to restore original magnitude. This allows SCLP to handle tensors with high dynamic range that would otherwise lose precision from exponent palette quantization.
+
+**Blob layout change:** Scales are inserted between the palette headers and ws_stream. See "Architecture & Format" section above for the full layout.
+
+**Overhead:** +6.25% for SCLP8 (0.0625 bytes/weight), +8.3% for SCLP6 (relative to compressed size).
+
+### Results
+
+**Gemma4-31B Dense** (SCLP6 attn + Q4_K gate/up + SCLP8 ffn_down, `-ctk turbo4 -ctv turbo4`):
+
+| Metric | Value |
+|---|---|
+| Size | 21.5 GB |
+| tg | 9.63 t/s |
+| pp | 34.15 t/s |
+| Output quality | Coherent, no garbling from first token |
+
+**Gemma4-26B MoE** (SCLP6 attn+ffn_down + Q4_K gate/up, opus imatrix, `-ctk turbo4 -ctv turbo4`):
+
+| Metric | Value |
+|---|---|
+| Size | 16.5 GB |
+| tg | 48.56 t/s |
+| pp | 71.59 t/s |
+| Output quality | High quality chain-of-thought, no mode collapse |
+
+### SCLP4 + Per-Block Scaling: Fundamentally Broken
+
+Per-block normalization concentrates all exponents near 126-127 (values ≈ ±1.0). With only 4 palette entries, the palette degenerates — all entries map to the same 2-3 exponents, reducing effective precision to sign + 1 mantissa bit + scale ≈ 2-bit scalar quantization. Tested on Gemma4-26B MoE: complete mode collapse even with imatrix sidecar.
+
+**Workaround:** Use Q4_K_M for tensors that would otherwise get SCLP4. A larger block size (QK_SCLP=256+) might help by preserving more exponent diversity, but has not been tested.
+
+### Implementation Notes
+
+- Scales must be stored as **BF16** (not FP16). The GPU kernels use `*reinterpret_cast<const __hip_bfloat16*>` to read scales — FP16 bits interpreted as BF16 produce garbage values (different exponent/mantissa bit widths).
+- Decode kernels that produce BF16 output must convert `float → BF16` via the **top** 16 bits of the float (`uint32 >> 16`), not the bottom 16 bits. `*reinterpret_cast<uint16_t*>(&float_val)` takes the low bytes on little-endian — wrong.
+- Sidecar values store the original unscaled BF16 weight. The sidecar fixup kernel writes them directly without scale multiplication.
+- Use `__bfloat162float()` for BF16→float, never `__low2float()` (which is for FP16 `__half2` pairs).
+
 ## Future Work: TurboQuant for KV Cache
 
 Orthogonal compression for KV cache (per-token rotation + low-bit quantization). Find community fork via upstream issue tracker. Integration: cherry-pick onto `sclp` branch, smoke-test Llama-3-8B, then layer onto weights. Expect rebase friction on KV cache type/node changes in ggml.
@@ -505,7 +553,14 @@ Wikitext-2-raw, `-c 512 -b 512 --chunks 50` on Gemma4-26B-A4B-IT:
 
 **Practical takeaway**: regenerate any SCLP6 GGUF older than 2026-05-16 10:19. Mixed-precision (`--format mixed`) is best Gemma4 config.
 
-### SCLP6 Inference Hang (Critical)
-In some cases, SCLP6 inference hangs after loading the model, consuming CPU time indefinitely without producing output. This does not appear to be a consistent issue and may be related to specific prompt/context combinations or GPU memory pressure.
+### SCLP6 Fused GEMV Bug (Resolved — May 2026)
 
-**Status:** Requires further investigation. SCLP6 works in some cases (model loading verified) but hangs in others.
+`sclp6_fused_gemv_kernel` produced garbled output on early tokens that self-corrected over time. Root cause: **sidecar omission**. With only 8 palette entries, SCLP6 has a significantly larger sidecar population (1-5% on attention tensors) than SCLP8 (16 entries, ~0.02%). Omitting sidecar correction in the fused GEMV causes per-weight magnitude errors of 4×+ that cascade through attention softmax. The "self-correcting" behavior is KV cache dilution — early errors dominate when few KV entries exist, then get averaged out.
+
+**Fix:** SCLP6 fused GEMV is disabled (`if (false && ...)` in `ggml-cuda.cu`). Two-pass decode (which includes sidecar fixup) is used instead. The SCLP8 fused GEMV remains enabled — 16 palette entries keep sidecar population negligible.
+
+**Note:** The original "SCLP6 Inference Hang" issue was likely caused by this same bug producing NaN/Inf values that hung the generation loop.
+
+### SCLP6/SCLP4 Fused GEMV K-Alignment Bug (Latent)
+
+Both SCLP6 and SCLP4 fused GEMV kernels assume per-row group padding (`row * ceil(K/group_size)`), but the encoder packs weights flat without per-row padding. When K is not a multiple of the group size (4 for SCLP6, 2 for SCLP4), rows after row 0 read from wrong byte offsets. Does not trigger on real models (LLM dimensions are always large multiples of 128) but should be fixed if the kernels are re-enabled.
