@@ -287,7 +287,7 @@ Three files were modified to support variable-size (compact) SCLP blobs:
 
 **`src/llama-model-loader.h`** — added `disk_size` to `llama_tensor_weight`:
 - Computed from `gguf_get_tensor_offset(i+1) - gguf_get_tensor_offset(i)` for all but the last tensor
-- Last tensor falls back to `ggml_nbytes(tensor)`
+- Last tensor: derived from file boundary (`file->size() - data_offset - tensor_offset`). Previously fell back to `ggml_nbytes(tensor)`, which truncated compact SCLP blobs (sidecar data past `ggml_nbytes` was never uploaded → sidecar fixup kernel read garbage `sc_count` → GPU hang). This was the root cause of the SCLP4 M>1 prefill stall and llama-bench stall.
 
 **`src/llama-model-loader.cpp`** — both data-loading paths handle compact blobs:
 - mmap GPU copy path (line ~1569): copies only `disk_size` bytes into a zero-padded `n_size` buffer before `ggml_backend_tensor_set`; uses `disk_size` for lmlock/mmaps_used tracking
@@ -633,10 +633,13 @@ uniform extra mantissa bit is less bit-efficient than targeted sidecar) and has 
 as a selectable type. See `plans/sclp4_vs_q4k_improvement.md` for the full data.
 
 ### Open Issues (May 2026)
-- **SCLP4 M>1 two-pass prefill stalls** (long prompts / PPL) while SCLP5/6/8 prefill are fast
-  (~1483 t/s). Specific to `sclp4_decode_blob_kernel` at large M; pre-existing. Blocks long-context
-  SCLP4. (Note: `-fa off` was a partial workaround for the perplexity variant.)
-- **llama-bench stalls on SCLP models** (498% CPU, never completes) while `llama-completion` works —
-  use completion's pp/tg timers for SCLP perf.
 - **GPU wedge from `kill -9` mid-kernel** on this WSL2/ROCm box → everything drops to ~0.16 t/s;
   bound GPU jobs with `timeout` and avoid killing mid-kernel (ROCm uses `/dev/dxg`, not `/dev/kfd`).
+
+### Resolved Issues (May 2026)
+- **SCLP4 M>1 two-pass prefill stalls + llama-bench stalls** — Root cause: last tensor in GGUF had
+  `disk_size` fall back to `ggml_nbytes(tensor)`, which for compact SCLP4 is smaller than the actual
+  blob (misses palette overhead + sidecar data). The sidecar fixup kernel read garbage `sc_count`
+  from uninitialized memory past the truncated upload → infinite kernel loop → GPU hang. Fix:
+  `llama-model-loader.h` now derives last-tensor `disk_size` from `file->size() - data_offset -
+  tensor_offset`. Verified: Llama-3-8B SCLP4 pp512=2445 t/s, tg128=26.4 t/s; llama-bench completes.
