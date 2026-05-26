@@ -130,7 +130,7 @@ VERSION 1 files (no sidecar) load correctly with an empty sidecar.
 - `testmodule.encode(input, palette)` accepts the palette array (≤16 uint8 exponent values); the wrapper builds the nearest-neighbour lookup internally. Returns `packed`, `sm`, `sidecar_indices`, `sidecar_values` (HIP module uses separate streams internally).
 - `testmodule.decode(packed, sm, palette, sidecar_indices=[], sidecar_values=[], num_weights_hint=-1)` — sidecar and num_weights args are optional; num_weights_hint is required for odd N.
 - The `mantissa_mask` parameter of `clip` is applied as `output = weight & (0xFF80 | mantissa_mask)`; pass `0x7F` to preserve all mantissa bits
-- The GEMV kernel omits sidecar correction intentionally — a block-scoped scan caused a 37% throughput regression. The ~0.01% of sidecar weights introduce negligible error for single-token generation.
+- The GEMV kernel now **folds sidecar correction in** (sorted-sidecar binary search, warp-per-row, smem x — no atomics). This superseded the old "omit sidecar" workaround (a block-scoped scan had caused a 37% regression). See "Folded Sidecar in Fused GEMV" below.
 
 ## llama.cpp Integration
 
@@ -146,16 +146,28 @@ cmake --build build --config Release -j$(nproc)
 
 ## Architecture & Format
 - **Current Standard**: SCLP8 (8-bit interleaved `ws_stream`).
-- **GGUF Types**: `GGML_TYPE_SCLP` (8-bit), `GGML_TYPE_SCLP4` (4-bit), `GGML_TYPE_SCLP6` (6-bit).
-- **Layout (all types, with per-block scaling)**: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size (1B), palette bytes]...[scales (BF16, ceil(N/32) per expert)][ws_stream][sidecar]`.
+- **GGUF Types**: `GGML_TYPE_SCLP` (8-bit), `GGML_TYPE_SCLP4` (4-bit), `GGML_TYPE_SCLP5` (5-bit), `GGML_TYPE_SCLP6` (6-bit).
+- **Layout (SCLP6/SCLP8, with per-block scaling)**: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size (1B), palette bytes]...[scales (BF16, ceil(N/32) per expert)][ws_stream][sidecar]`.
+- **Layout (SCLP4, with per-block palette)**: `[num_weights (4B)][n_experts (4B)][per-expert: palette_size=0 (1B)]...[block_palettes (4B per block, ceil(N/256) per expert)][ws_stream][sidecar]`.
 
 > [!NOTE]
-> All SCLP types (8/4/6) now share the same per-expert blob header format with per-block scaling (`QK_SCLP=32`). Scales are stored as BF16 (not FP16) to match the GPU kernels' `__hip_bfloat16` reinterpret. Sidecar values are stored as raw BF16 of the original unscaled weight — sidecar fixup writes them directly, bypassing scale multiplication.
+> SCLP6/SCLP8 use per-block scaling (PBS): a BF16 scale per `QK_SCLP=32` weights. SCLP4 uses **per-block palette** instead: each `QK_SCLP4=256` weight block gets its own 4-entry k-means exponent palette, stored as 4 uint8 values. PBS was fundamentally incompatible with SCLP4 (see "Per-Block Scaling" section). Per-block palette replaces the global palette + scales section; `palette_size=0` in the header signals this mode. Sidecar values are stored as raw BF16 of the original weight — sidecar fixup writes them directly.
 
+SCLP6/SCLP8 layout:
 ```
 [uint32 num_weights][uint32 n_experts]
 [per-expert: uint8 palette_size, uint8[] palette] ...
 [BF16 scales: ceil(expert_nw / 32) per expert, all experts contiguous]
+[ws_stream]
+[uint32 sidecar_count]
+[uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
+```
+
+SCLP4 layout (per-block palette):
+```
+[uint32 num_weights][uint32 n_experts]
+[per-expert: uint8 palette_size=0] ...
+[block_palettes: 4 × uint8 per block, ceil(expert_nw / 256) blocks per expert]
 [ws_stream]
 [uint32 sidecar_count]
 [uint32 × sidecar_count sidecar_indices][uint16 × sidecar_count sidecar_values]
@@ -340,26 +352,25 @@ Two hybrid variants tested:
 
 **C++ llama-quantize SCLP6+Q4_K (new, May 2026)** — single-step via patched `llama-quantize` with native SCLP types. Uses k-means palette + imatrix-sidecar 1% on the SCLP6 tensors. See "llama-quantize SCLP Support" below.
 
-llama-bench results on Gemma4-26B-A4B-IT (RX 7900 XTX, `-fa 1 -t 16`):
+llama-bench results on Gemma4-26B-A4B-IT (RX 7900 XTX, `-fa 1 -t 16`, opus imatrix, per-block palette SCLP4):
 
 | Config | Size | pp512 | tg128 |
 |---|---|---|---|
-| **MIXED-imatrix** (SCLP6 attn+ffn_down, SCLP4 gate/up) | 14.89 GiB | 1,137 | 64.5 |
-| **SCLP6+Q4K hybrid** (SCLP6 attn+ffn_down, Q4_K gate/up) | 15.80 GiB | **1,805** | **70.3** |
+| **MIXED-bpal** (SCLP6 attn+ffn_down, SCLP4 bpal gate/up) | 14.89 GiB | 1,194 | 42.0 |
+| **SCLP6+Q4K hybrid** (SCLP6 attn+ffn_down, Q4_K gate/up) | 15.80 GiB | **1,919** | **49.9** |
 
-The hybrid is **+59% prefill** and **+9% tg** at +0.9 GiB. Q4_K gate/up goes directly through rocBLAS INT8 — no two-pass SCLP decode for the bulk of weights.
+Q4_K hybrid is **+60% prefill** and **+19% tg** at +0.9 GiB. Q4_K gate/up goes directly through rocBLAS INT8 — no two-pass SCLP decode for the bulk of weights.
 
-PPL comparison (wikitext-test, `-c 512 -b 512 --chunks 50 -fa on`):
+OOD PPL comparison (opus-trace holdout, `-c 512 -b 512 --chunks 50 -fa on`, opus imatrix):
 
-| Config | Size | PPL |
+| Config | Size | OOD PPL |
 |---|---|---|
-| **MIXED-imatrix** (SCLP6+SCLP4+imatrix-sidecar 1%) ⭐ | 14.9 GiB | **940** |
-| **SCLP6-Q4K hybrid** (C++ llama-quantize, imatrix-sidecar on SCLP6) | 15.8 GiB | 8,877 |
-| Old Python SCLP6+Q4K (no imatrix on SCLP6) | 16.4 GB | 9,961 |
+| **MIXED-bpal** (SCLP6+SCLP4 bpal + imatrix-sidecar 1%) ⭐ | 14.9 GiB | **132.6 ± 7.1** |
+| **SCLP6-Q4K hybrid** (C++ llama-quantize, imatrix-sidecar on SCLP6) | 15.8 GiB | 290.4 ± 17.0 |
 
-The C++ hybrid is marginally better than the old Python version (imatrix-sidecar on SCLP6 working as expected), but Q4_K gate/up costs **~9× PPL** vs SCLP4+imatrix-sidecar. The Q4_K route trades quality for prefill throughput — pick MIXED-imatrix for quality, SCLP6-Q4K for prefill-bound workloads.
+SCLP4 with per-block palette beats Q4_K on quality by **2.2×** at **0.9 GiB smaller**. Q4_K wins on throughput (+60% pp, +19% tg). The right knob depends on workload: MIXED-bpal for decode-bound (chat, agentic), SCLP6+Q4K for prefill-bound (long-context RAG, batch).
 
-Q4_K is *not* a drop-in replacement for SCLP4 quality-wise (10.6× worse PPL on the old comparison), but for **attn+ffn_down=SCLP6 + gate/up=Q4_K** the speed win is significant. The right knob depends on workload (prefill vs decode bound).
+**Note on per-block palette vs old global palette**: The old MIXED-opus with global palette achieved OOD PPL 26.6 at 17.0 GiB — but that extra 2.1 GiB was almost entirely imatrix sidecar data. Per-block palette reduces mandatory sidecar (local palettes cover more exponents), which counterintuitively reduces sidecar-rescued weight count at the same budget. The 132.6 PPL is 5× worse absolute but at 2.1 GiB less storage. Per-byte, per-block palette is more efficient — the quality gap is entirely explained by the size difference.
 
 To produce the hybrid: requires a patch to `llama-quantize` (which only honored `--tensor-type` overrides when the default type was already quantized; now applies regardless — see `src/llama-quant.cpp`). Patch is local to this fork and worth upstreaming.
 
@@ -377,26 +388,27 @@ PPL on the held-out agentic OOD set (50 chunks, `-c 512 -b 512 -fa on`):
 
 | Config | Size | imatrix source | OOD PPL |
 |---|---|---|---|
-| **MIXED-opus** (SCLP6+SCLP4, opus imatrix) ⭐ | 17.0 GiB | opus traces, 200 chunks | **26.6 ± 1.1** |
-| MIXED-imatrix (SCLP6+SCLP4, wiki imatrix) | 14.9 GiB | wikitext, 80 chunks | 39.2 ± 1.8 |
-| SCLP6-Q4K-opus (SCLP6+Q4K, opus imatrix) | 16.7 GiB | opus traces | 157.6 ± 8.7 |
+| **MIXED-opus** (SCLP6+SCLP4 global, opus imatrix) | 17.0 GiB | opus traces, 200 chunks | **26.6 ± 1.1** |
+| **MIXED-bpal** (SCLP6+SCLP4 bpal, opus imatrix) | 14.9 GiB | opus traces | 132.6 ± 7.1 |
+| MIXED-imatrix (SCLP6+SCLP4 global, wiki imatrix) | 14.9 GiB | wikitext, 80 chunks | 39.2 ± 1.8 |
+| SCLP6-Q4K-opus (SCLP6+Q4K, opus imatrix) | 15.8 GiB | opus traces | 290.4 ± 17.0 |
 | SCLP6-Q4K (SCLP6+Q4K, wiki imatrix) | 15.8 GiB | wikitext | 161.6 ± 8.9 |
 
 **Key findings**:
 
-1. **Wikitext PPL was OOD-inflated by ~50×**. Same models drop from 940→39 (MIXED) and 8877→158 (Q4K hybrid) when measured on in-distribution agentic text. The wikitext numbers showed correct *ratios* between quants but absolute values were misleading.
+1. **Per-block palette SCLP4 beats Q4_K by 2.2× at smaller size** (132.6 vs 290.4, 14.9 vs 15.8 GiB). The throughput trade is +60% pp / +19% tg for Q4_K — worth it only for prefill-bound workloads.
 
-2. **Calibration domain matters for SCLP4 sidecar selection, barely for Q4_K**. Switching to opus-traces imatrix:
-   - MIXED model: −32% PPL (39.2 → 26.6). SCLP4+imatrix-sidecar picks different weights to rescue when calibrated on the target domain.
-   - Q4K hybrid: −2% PPL (161.6 → 157.6, within noise). Q4_K per-block scales are insensitive to per-column importance vs SCLP's direct top-k weight rescue.
+2. **Old global-palette SCLP4 was better on PPL but larger**. MIXED-opus (global palette, 17.0 GiB, PPL 26.6) vs MIXED-bpal (per-block palette, 14.9 GiB, PPL 132.6). The 2.1 GiB gap is almost entirely imatrix sidecar data — per-block palette reduces mandatory sidecar count (local palettes cover more exponents), so the same 1% budget rescues fewer additional weights. Per-byte efficiency is higher with per-block palette; the quality gap is explained by size.
 
-3. **SCLP4+imatrix-sidecar quality lead over Q4_K grows with calibration match**. With wiki-imatrix on both: 4.1× (39 vs 162). With opus-imatrix on both: **5.9× (27 vs 158)**.
+3. **Calibration domain matters for SCLP4 sidecar selection, barely for Q4_K**. Switching to opus-traces imatrix:
+   - MIXED model (global palette): −32% PPL (39.2 → 26.6). SCLP4+imatrix-sidecar picks different weights to rescue when calibrated on the target domain.
+   - Q4K hybrid: within noise. Q4_K per-block scales are insensitive to per-column importance vs SCLP's direct top-k weight rescue.
 
-4. **Size increased with opus imatrix** (17.0 vs 14.9 GiB for MIXED): the opus importance distribution promotes more weights into sidecar at the same 0.01 budget. Net result is still a Pareto win — same speed, +2 GiB, but 32% lower PPL.
+4. **Wikitext PPL was OOD-inflated by ~50×**. Same models drop from 940→39 (MIXED global) and 8877→158 (Q4K hybrid) when measured on in-distribution agentic text. The wikitext numbers showed correct *ratios* between quants but absolute values were misleading.
 
-**Recommendation**: For agentic/instruction-tuned use cases, calibrate imatrix on representative dialogue traces (not wikitext) when targeting SCLP4+imatrix-sidecar. Q4_K gate/up isn't worth it unless prefill-bound — costs 6× quality for +59% prefill.
+**Recommendation**: Per-block palette SCLP4 is the default for new MIXED builds (smaller, faster to encode, no PBS degeneration). For maximum quality when size is not constrained, global-palette SCLP4 with high imatrix sidecar budget still wins — but requires 2+ GiB more storage. Q4_K gate/up is only justified for prefill-bound workloads.
 
-To rebuild MIXED-opus from BF16:
+To rebuild MIXED-bpal from BF16 (per-block palette, current default):
 ```bash
 llama-quantize \
   --imatrix /home/ajkerchum/poc/eval_data/gemma4-opus-imatrix.dat \
@@ -404,7 +416,7 @@ llama-quantize \
   --tensor-type '^output\.weight$=BF16' \
   --tensor-type '^blk\.[0-9]+\.attn_(q|k|v|output)\.weight$=SCLP6' \
   --tensor-type '^blk\.[0-9]+\.ffn_down(_exps)?\.weight$=SCLP6' \
-  bf16-shard-00001-of-00002.gguf MIXED-opus.gguf SCLP4 8
+  bf16-shard-00001-of-00002.gguf MIXED-bpal.gguf SCLP4 8
 ```
 
 ## Known Issues
@@ -486,9 +498,22 @@ Per-block scaling adds a BF16 scale factor for every `QK_SCLP=32` weights. The e
 
 ### SCLP4 + Per-Block Scaling: Fundamentally Broken
 
-Per-block normalization concentrates all exponents near 126-127 (values ≈ ±1.0). With only 4 palette entries, the palette degenerates — all entries map to the same 2-3 exponents, reducing effective precision to sign + 1 mantissa bit + scale ≈ 2-bit scalar quantization. Tested on Gemma4-26B MoE: complete mode collapse even with imatrix sidecar.
+Per-block normalization concentrates all exponents near 126-127 (values ≈ ±1.0). With only 4 palette entries, the palette degenerates — all entries map to the same 2-3 exponents, reducing effective precision to sign + 1 mantissa bit + scale ≈ 2-bit scalar quantization. Tested on Gemma4-26B MoE: complete mode collapse even with imatrix sidecar. QK_SCLP4=256 avoids the VRAM exhaustion of QK=32 but still degrades quality (PPL 209 vs 117.6 without PBS on Llama-3-8B).
 
-**Workaround:** Use Q4_K_M for tensors that would otherwise get SCLP4. A larger block size (QK_SCLP=256+) might help by preserving more exponent diversity, but has not been tested.
+**Solution: Per-Block Palette (May 2026).** Instead of normalizing and sharing one global palette, each 256-weight block gets its own 4-entry k-means palette. This exploits local exponent variation rather than destroying it. No scale multiply needed — the decoder reads the block palette directly. `palette_size=0` in the blob header signals per-block palette mode.
+
+**Overhead:** 4 bytes per 256 weights = 1.56% (vs PBS's 0.78%). Net file size increase ~0.2 GiB on Llama-3-8B.
+
+**Results (Llama-3-8B, wikitext-2, 20 chunks, with imatrix)**:
+
+| Config | Size | PPL |
+|---|---|---|
+| **SCLP4 + per-block palette + imatrix** ⭐ | 6.15 GB | **102.4 ± 8.0** |
+| SCLP4 + imatrix (no PBS, global palette) | 5.95 GB | 117.6 |
+| SCLP4 + PBS (QK=256) + imatrix | 5.89 GB | 209 |
+| BF16 reference | 14.97 GB | ~10.6 |
+
+Per-block palette is now the only SCLP4 mode. Old SCLP4 GGUFs (with PBS or global palette) are incompatible — regenerate.
 
 ### Implementation Notes
 
@@ -564,3 +589,54 @@ Wikitext-2-raw, `-c 512 -b 512 --chunks 50` on Gemma4-26B-A4B-IT:
 ### SCLP6/SCLP4 Fused GEMV K-Alignment Bug (Latent)
 
 Both SCLP6 and SCLP4 fused GEMV kernels assume per-row group padding (`row * ceil(K/group_size)`), but the encoder packs weights flat without per-row padding. When K is not a multiple of the group size (4 for SCLP6, 2 for SCLP4), rows after row 0 read from wrong byte offsets. Does not trigger on real models (LLM dimensions are always large multiples of 128) but should be fixed if the kernels are re-enabled.
+
+## Folded Sidecar in Fused GEMV + SCLP5 (May 2026)
+
+**The recurring sidecar-vs-fused-GEMV perf problem is solved.** The encoder now **sorts the
+sidecar by weight index** (`src/llama-sclp.cpp`, shared by all SCLP types). Since
+`gidx = row*K + col`, a sorted sidecar means each output row's outlier entries form one
+**contiguous range**. Each dense fused GEMV (M=1) now **folds the correction in**: one warp per
+row binary-searches its sidecar range and adds `(true - palette_approx) * x[col]` using `x` already
+in shared memory — **no atomicAdd contention, no scattered x reads, no second kernel**. This
+replaces the old per-entry atomicAdd correction that was slower than two-pass.
+
+Sorting is order-irrelevant to the two-pass fixup and CPU decode, so prefill is unaffected. **Old
+SCLP GGUFs must be regenerated** — a fused GEMV on an *unsorted* sidecar melts down (binary search
+returns a bogus huge range → each row scans ~all sidecar entries → ~0.16 t/s). No back-compat guard
+(not prod).
+
+Applied to all four dense fused GEMVs (Llama-3-8B, RX 7900 XTX, coherent):
+
+| Type | tg t/s | Note |
+|---|---|---|
+| SCLP4 | 26.8 | now applies sidecar in tg (was omitted — quality win) |
+| SCLP5 | 28.9 | was 14.8 (two-pass) / 13.3 (old atomic correction) |
+| SCLP6 | 34.2 | **fused GEMV RE-ENABLED** (was `if(false)` — disable cause was sidecar omission) |
+| SCLP8 | ~30 | now applies sidecar (was omitted) |
+
+**Design note:** the folded pattern is **generation-path (M=1) only**. Prefill (M>1) uses two-pass:
+it materializes the whole weight matrix to BF16 and `sclp_fixup_sidecar_kernel` scatter-overwrites
+true sidecar values *before* the rocBLAS GEMM — already correct, and faster than a fused decode+GEMM
+for large M. Folding there would be redundant.
+
+### SCLP5 (5-bit: idx2 | sign1 | mant2)
+
+`GGML_TYPE_SCLP5 = 50` (blck_size=8, type_size=5). SCLP4's 4-entry per-block exponent palette plus a
+**second mantissa bit**; 8 weights packed into 5 bytes (eight 5-bit codes MSB-first in a 40-bit
+big-endian field). Full type: encoder/dequant (`llama-sclp.cpp`), GPU two-pass decode + sidecar +
+fused GEMV (`sclp_bridge.cuh`), CPU decode (`ggml-cpu.c`), `supports_op`/`get_alloc_size`/intercept
+(`ggml-cuda.cu`), compact-GGUF gate (`gguf.cpp`), loader gates (`llama-model-loader.cpp`), ftype +
+`llama-quantize` plumbing. `gguf-py/constants.py` NOT updated (C++ path only).
+
+**Verdict: SCLP5 is pareto-dominated by SCLP4 + imatrix-sidecar** (same PPL at smaller size — a
+uniform extra mantissa bit is less bit-efficient than targeted sidecar) and has no tg advantage. Kept
+as a selectable type. See `plans/sclp4_vs_q4k_improvement.md` for the full data.
+
+### Open Issues (May 2026)
+- **SCLP4 M>1 two-pass prefill stalls** (long prompts / PPL) while SCLP5/6/8 prefill are fast
+  (~1483 t/s). Specific to `sclp4_decode_blob_kernel` at large M; pre-existing. Blocks long-context
+  SCLP4. (Note: `-fa off` was a partial workaround for the perplexity variant.)
+- **llama-bench stalls on SCLP models** (498% CPU, never completes) while `llama-completion` works —
+  use completion's pp/tg timers for SCLP perf.
+- **GPU wedge from `kill -9` mid-kernel** on this WSL2/ROCm box → everything drops to ~0.16 t/s;
+  bound GPU jobs with `timeout` and avoid killing mid-kernel (ROCm uses `/dev/dxg`, not `/dev/kfd`).
