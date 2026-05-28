@@ -1,58 +1,62 @@
 # SCLP: Soft-Clipping Lossless-First Compression for LLM Weights
 
-SCLP is a lossless-first compression scheme for BF16 neural network weights that achieves **2× compression** per stream (8 bits/weight) with quality that matches or exceeds BF16 on large models. Three precision tiers (SCLP8/6/4) and mixed-precision policies enable fine-grained size–quality trade-offs, with imatrix-aware sidecar selection for instruction-tuned and MoE models.
+SCLP is an exponent-palette compression scheme for BF16 neural network weights. Four precision tiers (SCLP8/6/5/4) and mixed-precision policies enable fine-grained size-quality trade-offs, with imatrix-aware sidecar selection for instruction-tuned and MoE models.
+
+This repository contains the **reference implementation** (Python + HIP kernels). Production inference runs through our [llama.cpp fork](https://github.com/KerchumA222/llama.cpp) (branch `sclp`).
 
 ## Key Results
 
-### Llama-3-8B (SCLP8, RX 7900 XTX)
+### Llama-3-8B (dense, RX 7900 XTX)
 
-| Metric | Value |
-|---|---|
-| Compression ratio (SCLP streams) | **2.0×** (8 bits/weight vs 16) |
-| File size (compact GGUF) | **8.47 GB** (vs 14.97 GB BF16) |
-| PPL (wikitext-2) | **9.87** (vs 10.59 BF16) |
-| Generation speed | **~66 t/s** (vs ~52 t/s BF16) |
-| Prefill speed | **~2,730 t/s** (vs ~12,000 t/s BF16) |
+| Config | Size | tg128 (t/s) | pp512 (t/s) |
+|--------|------|-------------|-------------|
+| BF16 | 14.97 GB | ~52 | ~12,000 |
+| SCLP8 | 7.92 GB | 43 | ~2,650 |
+| SCLP6 | 6.71 GB | 38 | ~2,780 |
+| SCLP5 | 5.72 GB | 40 | ~2,650 |
+| SCLP4 | 4.86 GB | 34 | ~2,640 |
 
-### Gemma4-26B-A4B-IT (Mixed Precision, RX 7900 XTX)
+### Gemma4-26B-A4B-IT (MoE, RX 7900 XTX)
 
-| Config | Size | tg128 | OOD PPL |
-|---|---|---|---|
-| MIXED-opus (SCLP6 attn+ffn_down, SCLP4 gate/up, imatrix-sidecar 1%) | 17.0 GiB | 55 t/s | **26.6** |
-| SCLP6attn-opus (16 GB recipe: SCLP6 attn, SCLP4 rest) | 14.6 GiB | ~55 t/s | 40.0 |
-| Q5_K_M | 18 GB | — | 18,481 (wikitext) |
+OOD perplexity on held-out agentic traces (opus-trace, 50 chunks):
+
+| Config | Size | tg (t/s) | OOD PPL |
+|--------|------|----------|---------|
+| MIXED-opus (SCLP6 attn+down, SCLP4 gate/up, imatrix) | 17.0 GiB | 55 | **26.6** |
+| SCLP6attn-opus (16 GB recipe) | 14.6 GiB | ~55 | 40.0 |
+| MIXED-bpal (per-block palette SCLP4) | 14.9 GiB | 55 | 132.6 |
 
 ## How It Works
 
-BF16 weights have an 8-bit exponent field. In practice, any given weight matrix uses only **10–16 distinct exponent values** covering 99.9%+ of its weights. SCLP exploits this:
+BF16 weights have an 8-bit exponent field. In practice, any given weight matrix uses only 10-16 distinct exponent values covering 99.9%+ of its weights. SCLP exploits this:
 
-1. **Palette**: Record the top ≤16 exponent values (k-means by default; frequency available).
-2. **Interleaved stream (ws_stream)**: Store each weight in a single byte:
-   - **High nibble (4 bits)**: Index into the exponent palette.
-   - **Low nibble (4 bits)**: Sign bit + Top 3 mantissa bits (SMN).
-3. **Sidecar**: Store rare outlier weights (0.01–3%) verbatim as BF16. Optionally expanded via imatrix-aware selection for instruction-tuned models.
+1. **Palette**: K-means clustering selects the top exponent values (16 for SCLP8, 8 for SCLP6, 4 per block for SCLP4/5).
+2. **Packed stream**: Each weight is encoded as `palette_index | sign | mantissa_top_bits` at the type's bit width.
+3. **Sidecar**: Outlier weights (0.01-3%) are stored verbatim as BF16. Optionally expanded via imatrix-aware selection.
 
-Decoding is: `reconstruct(palette[index], smn_nibble)` — a single lookup + bitwise combine per weight. This maps directly to a fused decode-GEMV GPU kernel with negligible overhead.
+Decoding is a single lookup + bitwise combine per weight, mapping directly to a fused decode-GEMV GPU kernel.
 
 ### Precision Tiers
 
-| Type | Bits/weight | Palette bits | Mantissa bits | Use case |
-|---|---|---|---|---|
-| **SCLP8** | 8 | 4 (16 entries) | 3 | Default, near-lossless |
-| **SCLP6** | 6 | 4 (16 entries) | 1 | Attention layers, quality-sensitive |
-| **SCLP4** | 4 | 4 (16 entries) | 0 (sign only) | MLP gate/up, size-optimized |
+| Type | Bits/weight | Palette | Mantissa bits | Notes |
+|------|-------------|---------|---------------|-------|
+| **SCLP8** | 8 | 16 entries, global | 3 | Near-lossless, per-block BF16 scaling |
+| **SCLP6** | 6 | 8 entries, global | 2 | Attention layers, per-block BF16 scaling |
+| **SCLP5** | 5 | 4 entries, per-block | 2 | Pareto-dominated by SCLP4+imatrix |
+| **SCLP4** | 4 | 4 entries, per-block | 1 | Bulk MLP weights, best compression |
 
-Mixed-precision policies assign different tiers per tensor type (e.g., SCLP6 for attention, SCLP4 for gate/up projections).
+SCLP6/8 use per-block scaling (a BF16 scale per 32 weights). SCLP4/5 use per-block palettes (4 exponents per 256 weights) instead — per-block scaling degenerates at k=4 (concentrates all exponents near 126-127).
 
 ## Repository Layout
 
 ```
 src/compression/      Python reference implementation
   clipping.py         Stochastic exponent clipping
-  encoder.py          Palette builder + nibble packing
+  encoder.py          Palette builder + nibble packing (SCLP4/6/8)
   decoder.py          Vectorised BF16 reconstruction
   storage.py          .sclp binary file format
   pipeline.py         High-level compress/decompress API
+  imatrix.py          Importance matrix loader for sidecar selection
 
 src/hip/              HIP/ROCm GPU kernels
   clipping.hip        Soft-clip kernel
@@ -62,51 +66,50 @@ src/hip/              HIP/ROCm GPU kernels
   wrapper.cpp         pybind11 Python bindings
 
 tests/
-  convert_to_sclp_gguf.py    HuggingFace → SCLP GGUF converter
-  patch_gguf_sclp.py         Patch individual tensors in an existing GGUF
-  analyze_sidecar_cost.py    Rank tensors by sidecar drop cost
-  convert_selective_sidecar.py  Selective sidecar removal tool
-  test_pipeline.py           Core correctness tests
-  test_hip_module.py         HIP kernel tests (requires ROCm)
+  convert_to_sclp_gguf.py       HuggingFace -> SCLP GGUF converter
+  patch_gguf_sclp.py            Patch individual tensors in existing GGUF
+  prep_opus_trace.py            Build agentic-trace calibration/eval sets
+  test_pipeline.py              Core correctness tests
+  test_hip_module.py            HIP kernel tests (requires ROCm)
 
-design.md             Algorithm design rationale
-experimental_results.md  All benchmark results
-CLAUDE.md             Full implementation guide (llama.cpp integration, wire formats)
+design.md                       Algorithm design rationale
+experimental_results.md         Benchmark results and analysis
+plans/sclp4_vs_q4k_improvement.md  SCLP4 quality gap analysis
 ```
 
 ## llama.cpp Integration
 
-SCLP-compressed GGUFs can be run directly with our fork of llama.cpp:
-**[github.com/KerchumA222/llama.cpp](https://github.com/KerchumA222/llama.cpp) — branch `sclp`**
+SCLP-compressed GGUFs run directly with our [llama.cpp fork](https://github.com/KerchumA222/llama.cpp):
 
-Changes on top of upstream llama.cpp:
+| Branch | Contents |
+|--------|----------|
+| `sclp` | SCLP types + kernels on top of upstream llama.cpp |
+| `sclp-turboquant` | SCLP merged with [TurboQuant](https://github.com/TheTom/llama-cpp-turboquant) KV cache compression |
 
-- `GGML_TYPE_SCLP = 42`, `GGML_TYPE_SCLP4`, `GGML_TYPE_SCLP6` registered in `ggml.h` / `ggml.c`
-- `llama-quantize` natively supports `SCLP`, `SCLP4`, `SCLP6` as quantization types and `--tensor-type` overrides
-- On-device decode via `sclp_bridge.cuh` — self-parses blob header in shared memory, safe during HIP graph capture
-- Fused decode-GEMV kernel for single-token inference (~66 t/s vs ~52 t/s BF16 on RX 7900 XTX)
-- Fused MoE GEMV kernels for SCLP4/SCLP6 (decode only routed experts inline, no full buffer materialization)
-- GGUF loader supports compact blob format via `disk_size` field
+Key integration points:
+
+- `GGML_TYPE_SCLP8 = 47`, `SCLP6 = 48`, `SCLP4 = 49`, `SCLP5 = 50` registered in ggml
+- `llama-quantize` natively supports `SCLP4`, `SCLP5`, `SCLP6`, `SCLP8` as quantization types and `--tensor-type` overrides
+- Per-type GPU kernels in `ggml/src/ggml-cuda/sclp_bridge_sclp{4,5,6,8}.cu`: two-pass decode, fused GEMV (M=1), fused MoE GEMV, MoE WMMA prefill
+- Folded sidecar correction in fused GEMV (sorted sidecar, binary search per row, no atomics)
+- K-tiled shared memory for high occupancy (4 blocks/CU on SCLP4/5/6)
+- Compact GGUF storage — loader infers `disk_size` from tensor offsets
+
+See [docs/sclp.md](https://github.com/KerchumA222/llama.cpp/blob/sclp/docs/sclp.md) in the llama.cpp fork for the full inference guide.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.10+, numpy, torch, transformers
-- `gguf-py` from the llama.cpp fork (set `LLAMA_CPP_DIR` env var, or clone sibling to this repo as `../llama.cpp`)
 - ROCm (optional, for HIP kernels and llama.cpp inference)
 
 ### Setup
 
 ```bash
-# Clone this repo
-git clone https://github.com/KerchumA222/sclp sclp-research
-cd sclp-research
+git clone https://github.com/KerchumA222/sclp
+cd sclp
 
-# Clone the llama.cpp fork (sclp branch) as a sibling directory
-git clone -b sclp https://github.com/KerchumA222/llama.cpp llama.cpp
-
-# Create a venv and install Python dependencies
 python3 -m venv eval_env
 source eval_env/bin/activate
 pip install numpy torch transformers
@@ -127,56 +130,48 @@ cmake .. && make -j$(nproc) --no-print-directory
 # Produces python_pkg/testmodule.so
 ```
 
-### Convert a model
+### Quantize and run a model
 
-**Option A: llama-quantize (recommended for mixed-precision)**
 ```bash
-# Build llama.cpp first (see below), then:
-llama-quantize \
+# Clone and build the llama.cpp fork
+git clone -b sclp https://github.com/KerchumA222/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100
+cmake --build build --config Release -j$(nproc)
+
+# Quantize (mixed precision, recommended)
+build/bin/llama-quantize \
     --imatrix /path/to/imatrix.dat \
     --tensor-type '^token_embd\.weight$=BF16' \
     --tensor-type '^output\.weight$=BF16' \
     --tensor-type '^blk\.[0-9]+\.attn_(q|k|v|output)\.weight$=SCLP6' \
     --tensor-type '^blk\.[0-9]+\.ffn_down(_exps)?\.weight$=SCLP6' \
     bf16-input.gguf output.gguf SCLP4 8
-```
 
-**Option B: Python converter**
-```bash
-source eval_env/bin/activate
-python3 tests/convert_to_sclp_gguf.py \
-    --input  /path/to/bf16-model.gguf \
-    --output /path/to/model-SCLP.gguf \
-    --format mixed
-```
-
-### Build llama.cpp and run inference
-
-```bash
-cd ../llama.cpp
-cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100
-cmake --build build --config Release -j$(nproc)
-
+# Run inference
 build/bin/llama-completion \
-    -m /path/to/model-SCLP.gguf \
-    -ngl 99 -n 100 -no-cnv --repeat-penalty 1.3 \
+    -m output.gguf -ngl 99 -n 200 -no-cnv --repeat-penalty 1.3 \
     -p "The capital of France is"
 ```
 
 ## GGUF Blob Format
 
-All SCLP types (8/4/6) share the same per-expert blob header:
-
+SCLP6/SCLP8 (per-block scaling):
 ```
-[uint32 num_weights]
-[uint32 n_experts]
-[per-expert: uint8 palette_size, uint8 × palette_size palette] ...
-[uint8  × num_weights   ws_stream]        ← palette_idx(7:4) | smn(3:0)
-[uint32 sidecar_count]
-[uint32 × K             sidecar_indices]  ← positions of outlier weights
-[uint16 × K             sidecar_values]   ← full BF16 bits verbatim
+[uint32 num_weights][uint32 n_experts]
+[per-expert: uint8 palette_size, uint8[] palette] ...
+[BF16 scales: ceil(N/32) per expert]
+[ws_stream]
+[uint32 sidecar_count][uint32[] indices][uint16[] values]
 ```
 
-Each blob is stored at its actual compressed size, padded only to 32-byte GGUF alignment. The loader infers `disk_size` from consecutive tensor offsets.
+SCLP4/SCLP5 (per-block palette):
+```
+[uint32 num_weights][uint32 n_experts]
+[per-expert: uint8 palette_size=0] ...
+[block_palettes: 4 x uint8 per 256-weight block]
+[ws_stream]
+[uint32 sidecar_count][uint32[] indices][uint16[] values]
+```
 
-See `CLAUDE.md` for the full implementation guide including the llama.cpp loader changes.
+Each blob is stored at its actual compressed size, padded only to 32-byte GGUF alignment.
