@@ -46,9 +46,11 @@ def flatten(messages):
 
 
 def main():
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    default_dir = os.path.join(repo, 'eval_data', 'opus-trace')
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data-dir', default='/home/ajkerchum/poc/eval_data/opus-trace')
-    ap.add_argument('--out-dir',  default='/home/ajkerchum/poc/eval_data/opus-trace')
+    ap.add_argument('--data-dir', default=default_dir)
+    ap.add_argument('--out-dir',  default=default_dir)
     ap.add_argument('--holdout-per-split', type=int, default=50,
                     help='How many conversations from each split to hold out for OOD eval')
     ap.add_argument('--max-cal-conversations', type=int, default=5000,

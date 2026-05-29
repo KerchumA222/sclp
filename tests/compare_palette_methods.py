@@ -3,10 +3,10 @@ Compare frequency-based vs k-means palette selection for SCLP6.
 Generates synthetic BF16 weight tensors matching Gemma4's MoE expert dimensions
 and measures per-method reconstruction error.
 """
-import sys
+import os, sys
 import numpy as np
 
-sys.path.insert(0, '/home/ajkerchum/poc/src')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 from compression.encoder import encode_palette_6b
 
 

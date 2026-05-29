@@ -67,7 +67,6 @@ src/hip/              HIP/ROCm GPU kernels
 
 tests/
   convert_to_sclp_gguf.py       HuggingFace -> SCLP GGUF converter
-  patch_gguf_sclp.py            Patch individual tensors in existing GGUF
   prep_opus_trace.py            Build agentic-trace calibration/eval sets
   test_pipeline.py              Core correctness tests
   test_hip_module.py            HIP kernel tests (requires ROCm)
@@ -101,7 +100,8 @@ See [docs/sclp.md](https://github.com/KerchumA222/llama.cpp/blob/sclp/docs/sclp.
 
 ### Prerequisites
 
-- Python 3.10+, numpy, torch, transformers
+- Python 3.10–3.13, numpy, torch, transformers (3.14 ships a stdlib `compression`
+  package that shadows this repo's `compression/`; run from a 3.13-or-earlier venv)
 - ROCm (optional, for HIP kernels and llama.cpp inference)
 
 ### Setup
@@ -175,3 +175,8 @@ SCLP4/SCLP5 (per-block palette):
 ```
 
 Each blob is stored at its actual compressed size, padded only to 32-byte GGUF alignment.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The llama.cpp fork is likewise MIT-licensed (upstream
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)).

@@ -1,7 +1,9 @@
 """Test SCLP4 encode-decode roundtrip on real model weights."""
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-sys.path.insert(0, '/home/ajkerchum/llama.cpp/gguf-py')
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LLAMA_CPP = os.environ.get('LLAMA_CPP', os.path.join(_REPO, '..', 'llama.cpp'))
+sys.path.insert(0, os.path.join(_REPO, 'src'))
+sys.path.insert(0, os.path.join(_LLAMA_CPP, 'gguf-py'))
 
 import numpy as np
 from gguf import GGUFReader
@@ -35,7 +37,9 @@ def compute_metrics(orig: np.ndarray, decoded: np.ndarray, name: str):
 
 
 def main():
-    SHARD = '/home/ajkerchum/poc/models/gemma4/google_gemma-4-26B-A4B-it-bf16/google_gemma-4-26B-A4B-it-bf16-00001-of-00002.gguf'
+    SHARD = os.environ.get('SCLP_TEST_SHARD', os.path.join(
+        _REPO, 'models/gemma4/google_gemma-4-26B-A4B-it-bf16',
+        'google_gemma-4-26B-A4B-it-bf16-00001-of-00002.gguf'))
     reader = GGUFReader(SHARD)
 
     # Test on a dense attention tensor (n_experts=1)

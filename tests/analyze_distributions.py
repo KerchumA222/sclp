@@ -5,13 +5,20 @@ Reads a sample of MoE and attention tensors from the BF16 shards.
 import sys, os
 import numpy as np
 
-sys.path.insert(0, '/home/ajkerchum/poc/src')
-sys.path.insert(0, '/home/ajkerchum/llama.cpp/gguf-py')
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LLAMA_CPP = os.environ.get('LLAMA_CPP', os.path.join(_REPO, '..', 'llama.cpp'))
+sys.path.insert(0, os.path.join(_REPO, 'src'))
+sys.path.insert(0, os.path.join(_LLAMA_CPP, 'gguf-py'))
 import gguf
 
+# Set MODEL_DIR to the directory holding the BF16 GGUF shards.
+_MODEL_DIR = os.environ.get(
+    'MODEL_DIR',
+    os.path.join(_REPO, 'models/gemma4/google_gemma-4-26B-A4B-it-bf16'),
+)
 SHARDS = [
-    '/home/ajkerchum/poc/models/gemma4/google_gemma-4-26B-A4B-it-bf16/google_gemma-4-26B-A4B-it-bf16-00001-of-00002.gguf',
-    '/home/ajkerchum/poc/models/gemma4/google_gemma-4-26B-A4B-it-bf16/google_gemma-4-26B-A4B-it-bf16-00002-of-00002.gguf',
+    os.path.join(_MODEL_DIR, 'google_gemma-4-26B-A4B-it-bf16-00001-of-00002.gguf'),
+    os.path.join(_MODEL_DIR, 'google_gemma-4-26B-A4B-it-bf16-00002-of-00002.gguf'),
 ]
 
 SAMPLE_TENSORS = [

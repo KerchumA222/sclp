@@ -9,7 +9,7 @@ A **weight compression PoC** implementing SCLP (Soft Clipping Lossless-First) co
 2. Encodes exponents as 4-bit palette indices (≤16 unique exponents)
 3. Stores sign + 3-bit mantissa per weight in a packed stream
 
-See `design.md` for full rationale. Two implementations: **Pure Python/NumPy** (`src/compression/`, reference) and **HIP GPU kernels** (`src/hip/`, requires ROCm). The production path is the **llama.cpp integration** on the `sclp` branch at `/home/ajkerchum/llama.cpp`.
+See `design.md` for full rationale. Two implementations: **Pure Python/NumPy** (`src/compression/`, reference) and **HIP GPU kernels** (`src/hip/`, requires ROCm). The production path is the **llama.cpp integration** on the `sclp` branch of the fork, checked out alongside this repo at `$LLAMA_CPP` (defaults to `../llama.cpp`).
 
 ## Build & Test
 
@@ -19,7 +19,7 @@ cd src/hip && mkdir -p build && cd build && cmake .. && make -j$(nproc) --no-pri
 rocminfo | grep -i "amdgpu"          # verify ROCm hardware before HIP tests
 
 # llama.cpp sclp branch
-cd /home/ajkerchum/llama.cpp
+cd "$LLAMA_CPP"   # ../llama.cpp by default
 cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100
 cmake --build build --config Release -j$(nproc)
 
@@ -115,7 +115,7 @@ HIP kernels in `src/hip/` (`clipping.hip`, `encoder.hip`, `decoder.hip`, `launch
 ```bash
 # Current default MIXED build (SCLP6 attn+ffn_down, SCLP4 per-block-palette gate/up):
 llama-quantize \
-  --imatrix /home/ajkerchum/poc/eval_data/gemma4-opus-imatrix.dat \
+  --imatrix eval_data/gemma4-opus-imatrix.dat \
   --tensor-type '^token_embd\.weight$=BF16' \
   --tensor-type '^output\.weight$=BF16' \
   --tensor-type '^blk\.[0-9]+\.attn_(q|k|v|output)\.weight$=SCLP6' \
@@ -152,7 +152,7 @@ Budget sweep on Gemma4 mixed: 0→13,909 PPL, 0.5%→1,506, **1%→940**, 2%→1
 
 ### Running inference
 ```bash
-/home/ajkerchum/llama.cpp/build/bin/llama-completion \
+"$LLAMA_CPP"/build/bin/llama-completion \
     -m model.gguf -ngl 99 -n 100 -no-cnv --repeat-penalty 1.3 \
     -p "The capital of France is"
 ```
