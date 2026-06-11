@@ -91,6 +91,63 @@ def decode_palette_4b(encoded_data: dict, num_weights: int = None) -> np.ndarray
     return weights
 
 
+def decode_palette_4m(encoded_data: dict, num_weights: int = None) -> np.ndarray:
+    """
+    Decode SCLP4M back to BF16 uint16.
+
+    Each 256-weight block has a per-block 8-entry BF16 magnitude codebook.
+    nibble layout: bits[3:1] = codebook_idx, bit[0] = sign
+    Decode: mag = codebook[idx]; bits = mag | (sign << 15)
+
+    Supports multi-expert encoding (n_experts > 1) where block_codebooks is a
+    list of per-expert uint16[n_blocks_e, 8] arrays.
+    """
+    ws_stream = encoded_data['ws_stream']
+    block_codebooks = encoded_data['block_codebooks']
+    n_experts = encoded_data.get('n_experts', 1)
+    QK = 256
+
+    if num_weights is None:
+        num_weights = encoded_data.get('num_weights', len(ws_stream) * 2)
+
+    def _decode_4m(cb_array, ws, nw):
+        """cb_array: uint16[n_blocks, 8]; ws: packed nibble bytes; nw: number of weights."""
+        n_bytes = (nw + 1) // 2
+        ws_b    = ws[:n_bytes]
+        nibbles = np.empty(nw, dtype=np.uint8)
+        nibbles[0::2] = ws_b >> 4
+        if nw > 1:
+            n_odd = nw // 2
+            nibbles[1:nw:2] = ws_b[:n_odd] & 0x0F
+
+        idx  = (nibbles >> 1) & 0x7  # 3-bit codebook index
+        sign = (nibbles & 0x1).astype(np.uint16)
+
+        # Look up magnitude from per-block codebook
+        block_idx = np.arange(nw, dtype=np.int64) // QK
+        cb_entries = cb_array[block_idx, idx]  # uint16 BF16 magnitudes (sign bit = 0)
+        return (cb_entries | (sign << 15)).astype(np.uint16)
+
+    if n_experts == 1:
+        cb = block_codebooks  # uint16[n_blocks, 8]
+        weights = _decode_4m(cb, ws_stream, num_weights)
+    else:
+        expert_nw = num_weights // n_experts
+        parts     = []
+        ws_offset = 0
+        for e in range(n_experts):
+            ws_bytes = (expert_nw + 1) // 2
+            ws_e = ws_stream[ws_offset:ws_offset + ws_bytes]
+            parts.append(_decode_4m(block_codebooks[e], ws_e, expert_nw))
+            ws_offset += ws_bytes
+        weights = np.concatenate(parts)
+
+    sidecar = encoded_data.get('sidecar')
+    if sidecar is not None and len(sidecar['indices']) > 0:
+        weights[sidecar['indices']] = sidecar['values']
+    return weights
+
+
 def decode_palette_6b(encoded_data: dict, num_weights: int = None) -> np.ndarray:
     """
     Decode SCLP6 back to BF16.

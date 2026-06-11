@@ -67,8 +67,9 @@ HIP kernels in `src/hip/` (`clipping.hip`, `encoder.hip`, `decoder.hip`, `launch
 | `GGML_TYPE_SCLP6` (6-bit) | 48 | 4 | 3 |
 | `GGML_TYPE_SCLP4` (4-bit) | 49 | 2 | 1 |
 | `GGML_TYPE_SCLP5` (5-bit) | 50 | 8 | 5 |
+| `GGML_TYPE_SCLP4M` (4-bit magnitude codebook) | 51 | 2 | 1 |
 
-`GGML_TYPE_COUNT = 51`. Registered in `ggml/include/ggml.h`, `ggml/src/ggml.c` (`.type_name="sclp8"` etc., `.is_quantized=true`), `gguf-py/gguf/constants.py` (SCLP8/6/4 only — SCLP5 is C++-only). `ggml-cuda.cu` adds the MUL_MAT intercept in `ggml_cuda_mul_mat` and `case GGML_TYPE_SCLP8: return true;` in `supports_op`. **The `supports_op` entry is critical** — without it `select_weight_buft` returns nullptr at load and crashes.
+`GGML_TYPE_COUNT = 52`. Registered in `ggml/include/ggml.h`, `ggml/src/ggml.c` (`.type_name="sclp8"` etc., `.is_quantized=true`), `gguf-py/gguf/constants.py` (SCLP8/6/4 only — SCLP5 is C++-only). `ggml-cuda.cu` adds the MUL_MAT intercept in `ggml_cuda_mul_mat` and `case GGML_TYPE_SCLP8: return true;` in `supports_op`. **The `supports_op` entry is critical** — without it `select_weight_buft` returns nullptr at load and crashes.
 
 ### Blob layout (compact: stored at actual compressed size, padded to 32-byte GGUF alignment; size inferred from consecutive tensor offsets)
 
@@ -148,7 +149,7 @@ Applied to **sidecar selection, not palette k-means** (naive k-means weighting r
 llama-imatrix -m Q5_K_M.gguf -f wikitext-2-raw --output-format dat --chunks 80 -ngl 99 -c 512 --no-ppl
 # then: --imatrix path.dat --sidecar-imatrix-budget 0.01   (knee at 1%; recommended default)
 ```
-Budget sweep on Gemma4 mixed: 0→13,909 PPL, 0.5%→1,506, **1%→940**, 2%→1,026 (2% within error of 1% — quality floor). Calibrate from BF16 (not Q5_K_M) to avoid imatrix contamination (~hundreds PPL).
+Budget sweep on Gemma4 mixed: 0→13,909 PPL, 0.5%→1,506, **1%→940**, 2%→1,026 (2% within error of 1% — quality floor). **Calibration source:** prefer BF16 over Q5_K_M to avoid the quant's own rounding noise contaminating the importance signal (standard practice; not isolated in a controlled A/B here). The Gemma4 sweep above used a **Q5_K_M-sourced** imatrix — Gemma4 BF16 is 48 GB, won't fit the 24 GB card. Where a published BF16 imatrix existed off the shelf we used it (Qwen3.6: `eval_data/qwen36-bartowski-imatrix.gguf`, bartowski calibration_datav5, BF16-source). So "~hundreds PPL" contamination cost is inherited wisdom, not a number measured in this project.
 
 ### Running inference
 ```bash
@@ -199,6 +200,8 @@ BF16 scale per `QK_SCLP=32` weights; encoder normalizes block by max-abs before 
 
 **PBS is fundamentally broken for SCLP4:** normalization concentrates exponents near 126-127, the 4-entry palette degenerates to ~2-bit scalar quant → mode collapse. **Solution = per-block palette** (each 256-weight block gets its own 4-entry k-means palette; exploits local exponent variation instead of destroying it). Overhead 1.56%. Llama-3-8B SCLP4 wikitext: per-block palette **102.4 PPL** vs 117.6 (global) vs 209 (PBS QK=256). Per-block palette is now the **only** SCLP4 mode — old SCLP4 GGUFs incompatible.
 
+**SCLP4M** = per-block 8-entry BF16 *magnitude codebook* (idx3|sign1, 4.5 bpw). Each 256-weight block has its own codebook of 8 arbitrary BF16 magnitudes from linear-space Lloyd k-means over |w|. Decode is a pure table lookup: `bits = codebook[idx] | (sign<<15)`. No exponent palette, no mantissa bits, no scale. Removes the log-grid constraint of SCLP4 (~Q4_K storage budget). Python reference: `encode_palette_4m` / `decode_palette_4m` in `src/compression/encoder.py` / `decoder.py`.
+
 ### SCLP5 (5-bit: idx2 | sign1 | mant2)
 SCLP4's per-block palette + a 2nd mantissa bit; 8 weights → 5 bytes (eight 5-bit codes MSB-first in a 40-bit big-endian field). Full type implemented (encoder/dequant, GPU decode/sidecar/fused-GEMV, CPU decode, gates, ftype plumbing). **Pareto-dominated by SCLP4 + imatrix-sidecar** (uniform extra mantissa bit is less bit-efficient than targeted sidecar; no tg advantage). Kept selectable. Details: `plans/sclp4_vs_q4k_improvement.md`.
 
@@ -220,4 +223,4 @@ SCLP4's per-block palette + a 2nd mantissa bit; 8 weights → 5 bytes (eight 5-b
 ## Future Work
 - **Converter-side precision fallback:** detect at encode time when a SCLP4 blob exceeds BF16 size and fall back to SCLP6/BF16 — natural on-ramp to measured (not name-based) per-tensor precision.
 - **Per-tensor / per-expert precision & budget**; **error-magnitude sidecar** (rank by `importance × actual_error`).
-- **TurboQuant for KV cache** (orthogonal: per-token rotation + low-bit). Cherry-pick onto `sclp`, expect rebase friction on KV cache types.
+- **TurboQuant KV cache** (orthogonal: per-token rotation + low-bit) lives on `sclp-turboquant` — that branch is the `turboquant` (TheTom) fork base with SCLP cherry-picked *onto* it (not turbo onto sclp). It can't be rebased onto upstream directly: its fork base diverged long ago, so `git rebase origin/master` tries to replay ~533 non-cherry-equivalent commits → mass conflicts on the first old-upstream dup. Forward path = cherry-pick the ~58 turbo-specific commits (`fwht`/`turbo-innerq`/`fattn-*-turbo*`/`--turbo` flag) onto the clean rebased `sclp`. NB: the `GGML_TYPE_TURBO*` enums (42–46) currently in `sclp` are accidental backport cruft — but deleting them renumbers SCLP (47→42) and breaks existing SCLP GGUFs, so leave those slots reserved.

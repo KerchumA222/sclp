@@ -315,6 +315,203 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
     }
 
 
+def encode_palette_4m(weights_uint16: np.ndarray, n_experts: int = 1,
+                      importance: np.ndarray | None = None,
+                      K: int | None = None,
+                      sidecar_imatrix_budget: float = 0.0) -> dict:
+    """
+    Encode BF16 weights (as uint16 bit patterns) into the SCLP4M compressed format.
+
+    SCLP4M = per-block 8-entry BF16 magnitude codebook (idx3|sign1, 4.5 bpw).
+    Each 256-weight block has its own codebook of 8 arbitrary BF16 magnitudes derived
+    from 1-D Lloyd k-means over |w| in linear space.  Sign is stored separately.
+    No exponent palette, no mantissa bits, no per-block scale.
+
+    Output format (4 bits/weight, 2 weights per byte):
+      ws_stream:        uint8[ceil(N/2)]  — nibble = (idx<<1)|sign; high nibble = even weight
+      block_codebooks:  uint16[n_blocks, 8] — BF16 magnitude bit-patterns (sign bit 0)
+      sidecar:          {indices uint32[], values uint16[]}
+
+    Decode: mag = codebook[idx]; bits = mag | (sign<<15); weight_bf16 = bits
+
+    Deviation from C++ reference:
+      - k-means init: C++ uses exact quantile positions q=(2j+1)*n/16 on sorted magnitudes.
+        Python does the same (see _kmeans_magnitude_codebook_block below).
+      - Convergence: 15 Lloyd iterations (same as C++); midpoint-boundary assignment
+        over sorted magnitudes (same algorithm, vectorised with numpy).
+      - No stochastic rounding (SCLP4M has no mantissa grid, so it's inapplicable).
+
+    importance: optional float32[n_experts, K] imatrix values. When provided, the
+                discretionary sidecar rescues the top `sidecar_imatrix_budget` fraction
+                of weights ranked by importance × err². No mandatory sidecar tier
+                (the adaptive codebook handles outliers; mandatory tier would be redundant).
+    """
+    weights = weights_uint16.flatten().astype(np.uint16)
+    num_weights = len(weights)
+    QK = 256  # block size — matches QK_SCLP4 in C++
+
+    if importance is not None:
+        if K is None:
+            raise ValueError("encode_palette_4m: K (input dim) required when importance is provided")
+        if importance.shape != (n_experts, K):
+            raise ValueError(f"encode_palette_4m: importance shape {importance.shape} != ({n_experts}, {K})")
+
+    sidecar_indices_all = []
+    sidecar_values_all  = []
+
+    def _kmeans_magnitude_codebook_block(block_float: np.ndarray) -> np.ndarray:
+        """1-D Lloyd k-means over |w| for one block → 8 BF16 magnitude bit-patterns.
+
+        Matches kmeans_magnitude_codebook() in llama-sclp.cpp:
+          - quantile init: c[j] = sorted_mags[(2j+1)*n/16]
+          - 15 Lloyd iterations with midpoint-boundary assignment on sorted mags
+          - centroids stored as float_to_bf16(c[j]) & 0x7FFF (sign bit cleared)
+        """
+        mags = np.abs(block_float).astype(np.float32)
+        sorted_mags = np.sort(mags)
+        n = len(sorted_mags)
+        k = 8
+
+        # Quantile init (same as C++)
+        c = np.empty(k, dtype=np.float32)
+        for j in range(k):
+            q = (2 * j + 1) * n // 16
+            if q >= n:
+                q = n - 1
+            c[j] = sorted_mags[q]
+
+        for _ in range(15):
+            # Midpoint-boundary assignment on sorted magnitudes (matches C++ inner loop)
+            # Boundaries between cluster j and j+1 are at 0.5*(c[j]+c[j+1])
+            boundaries = 0.5 * (c[:-1] + c[1:])  # shape (7,)
+            labels = np.searchsorted(boundaries, sorted_mags)  # shape (n,)
+
+            new_c = np.empty(k, dtype=np.float64)
+            converged = True
+            for j in range(k):
+                mask = labels == j
+                if mask.any():
+                    nc = float(sorted_mags[mask].mean())
+                    if abs(nc - float(c[j])) > 1e-8:
+                        converged = False
+                    new_c[j] = nc
+                else:
+                    new_c[j] = c[j]
+            c = new_c.astype(np.float32)
+            if converged:
+                break
+
+        # Store as BF16 magnitude bit-patterns (sign bit cleared), using RNE
+        cb_f32 = c.astype(np.float32)
+        cb_u32 = cb_f32.view(np.uint32)
+        lsb = (cb_u32 >> 16) & 1
+        bias = np.uint32(0x7FFF) + lsb
+        cb_bf16 = ((cb_u32.astype(np.uint64) + bias.astype(np.uint64)) >> 16).astype(np.uint16)
+        cb_bf16 = cb_bf16 & np.uint16(0x7FFF)  # clear sign bit — magnitude only
+        return cb_bf16  # uint16[8]
+
+    def _encode_4m_expert(expert_weights_u16, expert_float, expert_offset=0, expert_imp=None):
+        """Encode a single expert.  Returns (block_codebooks_u16, ws_bytes)."""
+        nw = len(expert_weights_u16)
+        n_blocks = (nw + QK - 1) // QK
+
+        block_codebooks = np.zeros((n_blocks, 8), dtype=np.uint16)
+        indices   = np.zeros(nw, dtype=np.uint8)
+        sm_nibbles = np.zeros(nw, dtype=np.uint8)  # sign bit only
+
+        for b in range(n_blocks):
+            b_start = b * QK
+            b_end   = min(b_start + QK, nw)
+            blk_f   = expert_float[b_start:b_end]
+
+            cb = _kmeans_magnitude_codebook_block(blk_f)
+            block_codebooks[b] = cb
+            cb_f = (cb.astype(np.uint32) << 16).view(np.float32)  # BF16 → float32
+
+            mags = np.abs(blk_f).astype(np.float32)
+            # Index search: pick cb entry minimising |cb[j] - |w||
+            errs = np.abs(mags[:, None] - cb_f[None, :])  # (blk, 8)
+            best_idx = errs.argmin(axis=1).astype(np.uint8)
+            indices[b_start:b_end]    = best_idx
+            sm_nibbles[b_start:b_end] = (blk_f < 0).astype(np.uint8)  # sign
+
+        # Discretionary imatrix sidecar
+        if expert_imp is not None and sidecar_imatrix_budget > 0.0:
+            K_dim = expert_imp.shape[0]
+            col_idx = np.arange(nw, dtype=np.int64) % K_dim
+            per_weight_imp = expert_imp[col_idx]
+
+            # Reconstruction error: |bf16(codebook[idx]) - |w||
+            block_idx_per_w = np.arange(nw, dtype=np.int64) // QK
+            cb_flat = block_codebooks[block_idx_per_w, indices]  # uint16 BF16 magnitudes
+            recon_f = (cb_flat.astype(np.uint32) << 16).view(np.float32)
+            orig_f  = expert_float.astype(np.float32)
+            err2    = (recon_f - np.abs(orig_f)) ** 2
+
+            priority = per_weight_imp * err2
+            n_extra  = int(nw * sidecar_imatrix_budget)
+            outlier_mask = np.zeros(nw, dtype=bool)
+            if n_extra > 0:
+                cand = np.argpartition(priority, -n_extra)[-n_extra:]
+                cand = cand[priority[cand] > 0]
+                outlier_mask[cand] = True
+        else:
+            outlier_mask = np.zeros(nw, dtype=bool)
+
+        if outlier_mask.any():
+            out_pos = np.where(outlier_mask)[0].astype(np.uint32)
+            sidecar_indices_all.append(out_pos + expert_offset)
+            sidecar_values_all.append(expert_weights_u16[outlier_mask])
+
+        # Pack nibbles: nibble = (idx<<1)|sign; high nibble = even weight
+        nibbles = ((indices & 0x7) << 1 | sm_nibbles).astype(np.uint8)
+        num_bytes = (nw + 1) // 2
+        ws = np.zeros(num_bytes, dtype=np.uint8)
+        ws[:] = (nibbles[0::2] << 4)
+        if nw > 1:
+            n_odd = nw // 2
+            ws[:n_odd] |= nibbles[1::2]
+
+        return block_codebooks, ws
+
+    # Convert weights to float32 for magnitude operations
+    weights_f32 = (weights.astype(np.uint32) << 16).view(np.float32)
+
+    if n_experts == 1:
+        eimp = importance[0] if importance is not None else None
+        block_codebooks, ws_stream = _encode_4m_expert(weights, weights_f32,
+                                                        expert_offset=0, expert_imp=eimp)
+    else:
+        expert_nw = num_weights // n_experts
+        all_cb    = []
+        ws_parts  = []
+        for e in range(n_experts):
+            ew   = weights[e * expert_nw:(e + 1) * expert_nw]
+            ewf  = weights_f32[e * expert_nw:(e + 1) * expert_nw]
+            eimp = importance[e] if importance is not None else None
+            cb, ws = _encode_4m_expert(ew, ewf, expert_offset=e * expert_nw, expert_imp=eimp)
+            all_cb.append(cb)
+            ws_parts.append(ws)
+        # block_codebooks is a list of arrays per expert when n_experts > 1
+        block_codebooks = all_cb
+        ws_stream = np.concatenate(ws_parts)
+
+    if sidecar_indices_all:
+        sc_indices = np.concatenate(sidecar_indices_all).astype(np.uint32)
+        sc_values  = np.concatenate(sidecar_values_all).astype(np.uint16)
+    else:
+        sc_indices = np.array([], dtype=np.uint32)
+        sc_values  = np.array([], dtype=np.uint16)
+
+    return {
+        'block_codebooks': block_codebooks,  # uint16[n_blocks, 8] or list[uint16[n_blocks_e, 8]]
+        'ws_stream':       ws_stream,
+        'num_weights':     num_weights,
+        'n_experts':       n_experts,
+        'sidecar':         {'indices': sc_indices, 'values': sc_values},
+    }
+
+
 def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
                       palette_method: str = 'kmeans',
                       sidecar_dist: int = 0,

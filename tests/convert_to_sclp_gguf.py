@@ -22,7 +22,7 @@ import _setup_paths  # noqa: F401
 
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 from gguf.constants import GGUFValueType, GGML_QUANT_SIZES
-from compression.encoder import encode_palette, encode_palette_4b, encode_palette_6b
+from compression.encoder import encode_palette, encode_palette_4b, encode_palette_6b, encode_palette_4m
 from compression.imatrix import load_imatrix, per_column_importance
 
 SCLP_TARGET_SUFFIXES = [
@@ -244,6 +244,48 @@ def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
     return blob
 
 
+def build_sclp4m_blob(data_u16: np.ndarray, shape: list = None,
+                      importance: np.ndarray | None = None,
+                      sidecar_imatrix_budget: float = 0.0) -> bytes:
+    """Encode uint16 BF16 weights into a compact SCLP4M blob.
+
+    Blob layout (matches C++ llama_tensor_quantize_sclp SCLP4M branch):
+        [u32 num_weights][u32 n_experts]
+        [per-expert: u8 palette_size=0]    (one byte per expert, always 0 for SCLP4M)
+        [block_codebooks: 8×u16 per 256-weight block, all experts contiguous]
+        [ws_stream: ceil(expert_nw/2) bytes per expert, contiguous]
+        [sidecar v2]
+
+    For MoE tensors shape=[n_experts, N, K]; K = shape[-1] (innermost dim).
+    """
+    n_experts = shape[0] if (shape is not None and len(shape) >= 3) else 1
+    K = int(shape[-1]) if shape is not None and len(shape) >= 1 else None
+    encoded = encode_palette_4m(data_u16, n_experts=n_experts,
+                                importance=importance, K=K if importance is not None else None,
+                                sidecar_imatrix_budget=sidecar_imatrix_budget)
+    num_weights     = len(data_u16)
+    ws              = encoded['ws_stream'].astype(np.uint8)
+    sidecar_indices = encoded['sidecar']['indices'].astype(np.uint32)
+    sidecar_values  = encoded['sidecar']['values'].astype(np.uint16)
+
+    # Header: num_weights, n_experts, then one palette_size=0 byte per expert
+    header = struct.pack('<II', num_weights, n_experts) + b'\x00' * n_experts
+
+    # Block codebooks: 8×u16 per block, all experts contiguous
+    if n_experts == 1:
+        cb_bytes = encoded['block_codebooks'].astype(np.uint16).tobytes()
+    else:
+        cb_bytes = b''.join(cb.astype(np.uint16).tobytes() for cb in encoded['block_codebooks'])
+
+    blob = (
+        header
+        + cb_bytes
+        + ws.tobytes()
+        + build_sidecar_v2(sidecar_indices, sidecar_values, num_weights, K)
+    )
+    return blob
+
+
 def _load_tensor_from_mmap(gguf_path: str, byte_offset: int, n_elements: int,
                            tensor_type_val: int) -> np.ndarray:
     """mmap a tensor directly from the GGUF file and convert to BF16 uint16."""
@@ -271,7 +313,12 @@ def _encode_worker(prec: str, gguf_path: str, byte_offset: int, n_elements: int,
                    tmp_path: str, n_experts: int) -> tuple:
     """Worker: mmap tensor from GGUF, encode, write blob to tmp_path, return summary."""
     data_u16 = _load_tensor_from_mmap(gguf_path, byte_offset, n_elements, tensor_type_val)
-    if prec == 'sclp4':
+    if prec == 'sclp4m':
+        blob = build_sclp4m_blob(data_u16, shape=shape,
+                                 importance=importance,
+                                 sidecar_imatrix_budget=sidecar_imatrix_budget)
+        ws_len = (len(data_u16) + 1) // 2
+    elif prec == 'sclp4':
         blob = build_sclp4_blob(data_u16, shape=shape, sidecar_dist=sidecar_dist,
                                 importance=importance,
                                 sidecar_imatrix_budget=sidecar_imatrix_budget)
@@ -292,9 +339,19 @@ def _encode_worker(prec: str, gguf_path: str, byte_offset: int, n_elements: int,
 
     # Compute offsets from blob bytes
     n_exp = struct.unpack_from('<I', blob, 4)[0]
+    nw    = struct.unpack_from('<I', blob, 0)[0]
     pos = 8
     for _ in range(n_exp):
         pos += 1 + blob[pos]
+    # For SCLP4 / SCLP4M the block table section immediately follows palette headers.
+    # SCLP4:  4 B/block × n_blocks (n_blocks = nw // 256 across all experts)
+    # SCLP4M: 16 B/block × n_blocks
+    # SCLP6/8 have PBS scales which were already included in the per-expert palette headers
+    # (palette_size > 0) so pos already points at ws_stream for those types.
+    if prec in ('sclp4', 'sclp4m'):
+        n_blocks = (nw + 255) // 256
+        bytes_per_block = 16 if prec == 'sclp4m' else 4
+        pos += n_blocks * bytes_per_block
     ws_offset = pos
     sc_count = struct.unpack_from('<I', blob, ws_offset + ws_len)[0]
     return (len(blob), sc_count, ws_offset, ws_len)
