@@ -117,7 +117,35 @@ def to_bf16_uint16(tensor_data: np.ndarray, tensor_type: GGMLQuantizationType) -
     raise ValueError(f"Unsupported source type for SCLP encoding: {tensor_type}")
 
 
-def build_sclp_blob(data_u16: np.ndarray, n_experts: int = 1) -> bytes:
+def build_sidecar_v2(indices: np.ndarray, values: np.ndarray,
+                     num_weights: int, K: int | None) -> bytes:
+    """Serialize the sidecar v2 section (matches llama-sclp.cpp / sclp_bridge_common.cuh):
+
+        [u32 count|bit31] [u32 K] [u32 row_offsets[n_rows+1]] [u16 cols] [u16 vals]
+
+    bit31 of the count word is the v2 format flag; decoders treat blobs without it
+    as having an empty sidecar. Entries are stored sorted by (row, col).
+    """
+    count = int(len(indices))
+    out = struct.pack('<I', 0x80000000 | count)
+    if count == 0:
+        return out
+    if not K or K <= 0 or K > 65536 or num_weights % K != 0:
+        raise ValueError(f"sidecar v2 requires row length K in (0, 65536] dividing "
+                         f"num_weights (K={K}, num_weights={num_weights})")
+    order = np.argsort(indices, kind='stable')
+    indices = indices[order].astype(np.uint32)
+    values  = values[order].astype(np.uint16)
+    n_rows = num_weights // K
+    counts = np.bincount(indices // K, minlength=n_rows)
+    offs = np.zeros(n_rows + 1, dtype=np.uint32)
+    offs[1:] = np.cumsum(counts).astype(np.uint32)
+    cols = (indices % K).astype(np.uint16)
+    return (out + struct.pack('<I', K)
+            + offs.tobytes() + cols.tobytes() + values.tobytes())
+
+
+def build_sclp_blob(data_u16: np.ndarray, n_experts: int = 1, shape: list = None) -> bytes:
     """Encode uint16 BF16 weights into a compact SCLP (8-bit) blob (compact format)."""
     encoded = encode_palette(data_u16, n_experts=n_experts)
     num_weights     = len(data_u16)
@@ -133,13 +161,12 @@ def build_sclp_blob(data_u16: np.ndarray, n_experts: int = 1) -> bytes:
         for p in palettes:
             palette_header += struct.pack('<B', len(p)) + p.astype(np.uint8).tobytes()
 
+    K = int(shape[-1]) if shape is not None and len(shape) >= 1 else None
     blob = (
         struct.pack('<II', num_weights, n_experts)
         + palette_header
         + ws.tobytes()
-        + struct.pack('<I', len(sidecar_indices))
-        + sidecar_indices.tobytes()
-        + sidecar_values.tobytes()
+        + build_sidecar_v2(sidecar_indices, sidecar_values, num_weights, K)
     )
     return blob
 
@@ -176,9 +203,7 @@ def build_sclp4_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
         struct.pack('<II', num_weights, n_experts)
         + palette_header
         + ws.tobytes()
-        + struct.pack('<I', len(sidecar_indices))
-        + sidecar_indices.tobytes()
-        + sidecar_values.tobytes()
+        + build_sidecar_v2(sidecar_indices, sidecar_values, num_weights, K)
     )
     return blob
 
@@ -214,9 +239,7 @@ def build_sclp6_blob(data_u16: np.ndarray, shape: list = None, sidecar_dist: int
         struct.pack('<II', num_weights, n_experts)
         + palette_header
         + ws.tobytes()
-        + struct.pack('<I', len(sidecar_indices))
-        + sidecar_indices.tobytes()
-        + sidecar_values.tobytes()
+        + build_sidecar_v2(sidecar_indices, sidecar_values, num_weights, K)
     )
     return blob
 
@@ -259,7 +282,7 @@ def _encode_worker(prec: str, gguf_path: str, byte_offset: int, n_elements: int,
                                 sidecar_imatrix_budget=sidecar_imatrix_budget)
         ws_len = ((len(data_u16) + 3) // 4) * 3
     else:  # sclp8
-        blob = build_sclp_blob(data_u16, n_experts=n_experts)
+        blob = build_sclp_blob(data_u16, n_experts=n_experts, shape=shape)
         if len(blob) % 2 != 0:
             blob += b'\x00'
         ws_len = len(data_u16)

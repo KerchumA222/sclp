@@ -231,22 +231,34 @@ def encode_palette_4b(weights_uint16: np.ndarray, n_experts: int = 1,
 
         # Discretionary sidecar (imatrix-aware): on top of the mandatory set, rescue the
         # top `sidecar_imatrix_budget` fraction of remaining weights ranked by
-        # `importance × distance`. Weights with dist == 0 contribute 0 priority and
-        # never get rescued (their only error is mantissa truncation, which sidecar
-        # can't avoid). Weights with high importance × distance dominate the ranking.
+        # `importance × squared_reconstruction_error`. The sidecar stores verbatim BF16
+        # so it fixes both exponent error AND mantissa truncation — dist-0 weights are
+        # valid candidates (their mantissa error is real and rescued by the sidecar).
+        # Reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top1<<6)
         if expert_imp is not None and sidecar_imatrix_budget > 0.0:
             K_dim = expert_imp.shape[0]
             col_idx = np.arange(len(expert_weights), dtype=np.int64) % K_dim
             per_weight_imp = expert_imp[col_idx]  # float32, broadcast over rows
-            priority = per_weight_imp * per_weight_dist.astype(np.float32)
+
+            # Compute reconstruction error for every weight.
+            sign_bits    = ((expert_weights >> 15) & 0x1).astype(np.uint16)
+            mant_top1    = ((expert_weights >> 6)  & 0x1).astype(np.uint16)
+            recon_bits   = ((sign_bits << 15)
+                            | (palette[indices].astype(np.uint16) << 7)
+                            | (mant_top1 << 6)).astype(np.uint16)
+            # Convert uint16 BF16 bits → float32 via uint32 view.
+            orig_f32  = (expert_weights.astype(np.uint32) << 16).view(np.float32)
+            recon_f32 = (recon_bits.astype(np.uint32) << 16).view(np.float32)
+            sq_err    = (orig_f32 - recon_f32) ** 2
+
+            priority = per_weight_imp * sq_err
             # Exclude already-mandatory entries from the ranking.
             priority = np.where(outlier_mask, -np.inf, priority)
             n_extra = int(len(expert_weights) * sidecar_imatrix_budget)
             if n_extra > 0:
                 # argpartition gives indices of the top n_extra by priority.
                 cand = np.argpartition(priority, -n_extra)[-n_extra:]
-                # Only keep ones with strictly positive priority (otherwise we'd be
-                # sidecaring dist-0 weights, which is wasteful).
+                # Keep only entries with strictly positive priority (zero sq_err → no gain).
                 cand = cand[priority[cand] > 0]
                 outlier_mask[cand] = True
 
@@ -381,12 +393,25 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
         else:
             outlier_mask = np.zeros(len(expert_weights), dtype=bool)
 
-        # Imatrix-aware discretionary sidecar (see SCLP4 implementation comment).
+        # Imatrix-aware discretionary sidecar: ranked by importance × squared
+        # reconstruction error (same logic as SCLP4; see that block for rationale).
+        # Reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top2<<5)
         if expert_imp is not None and sidecar_imatrix_budget > 0.0:
             K_dim = expert_imp.shape[0]
             col_idx = np.arange(len(expert_weights), dtype=np.int64) % K_dim
             per_weight_imp = expert_imp[col_idx]
-            priority = per_weight_imp * per_weight_dist.astype(np.float32)
+
+            # Compute reconstruction error for every weight.
+            sign_bits    = ((expert_weights >> 15) & 0x1).astype(np.uint16)
+            mant_top2    = ((expert_weights >> 5)  & 0x3).astype(np.uint16)
+            recon_bits   = ((sign_bits << 15)
+                            | (palette[indices].astype(np.uint16) << 7)
+                            | (mant_top2 << 5)).astype(np.uint16)
+            orig_f32  = (expert_weights.astype(np.uint32) << 16).view(np.float32)
+            recon_f32 = (recon_bits.astype(np.uint32) << 16).view(np.float32)
+            sq_err    = (orig_f32 - recon_f32) ** 2
+
+            priority = per_weight_imp * sq_err
             priority = np.where(outlier_mask, -np.inf, priority)
             n_extra = int(len(expert_weights) * sidecar_imatrix_budget)
             if n_extra > 0:
