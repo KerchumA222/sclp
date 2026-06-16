@@ -1,6 +1,20 @@
 import numpy as np
 
 
+def _mag_sum_weights(unique_exponents: np.ndarray, weights_u16: np.ndarray) -> np.ndarray:
+    """
+    Compute per-unique-exponent sum(|w|) for use as k-means weights.
+
+    Returns float64 array of the same length as unique_exponents.  Entries are
+    guaranteed ≥ 1e-12 so they can safely be used as probability masses.
+    """
+    exponents_all = ((weights_u16 >> 7) & 0xFF).astype(np.uint8)
+    orig_mag = np.abs((weights_u16.astype(np.uint32) << 16).view(np.float32))
+    mag_weights = np.array([float(orig_mag[exponents_all == ue].sum()) for ue in unique_exponents],
+                            dtype=np.float64)
+    return np.maximum(mag_weights, 1e-12)
+
+
 def _kmeans_palette(unique_exponents: np.ndarray, counts: np.ndarray, k: int,
                     n_iter: int = 20) -> np.ndarray:
     """
@@ -40,7 +54,11 @@ def _kmeans_palette(unique_exponents: np.ndarray, counts: np.ndarray, k: int,
                 new_centers[j] = (exponents[mask] * weights[mask]).sum() / weights[mask].sum()
             else:
                 # dead cluster: reinitialise to most-frequent unrepresented exponent
-                represented = set(exponents[labels == i] for i in range(k) if i != j)
+                other_arrays = [exponents[labels == i] for i in range(k) if i != j]
+                if other_arrays:
+                    represented = set(np.concatenate(other_arrays).tolist())
+                else:
+                    represented = set()
                 unrepresented = [i for i, e in enumerate(exponents) if e not in represented]
                 if unrepresented:
                     new_centers[j] = exponents[max(unrepresented, key=lambda i: weights[i])]
@@ -94,10 +112,16 @@ def encode_palette(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
     sidecar_values_all  = []
 
     def _encode_8b_expert(expert_weights, expert_offset=0):
-        # 1. Exponent palette: top 16 unique exponents by frequency
+        # 1. Exponent palette: top 16 unique exponents by sum(|w|) in each exponent bin.
+        # Magnitude-weighted selection ensures high-magnitude exponents are represented;
+        # frequency-only selection can waste palette slots on near-zero (exp≈0) weights
+        # that contribute negligibly to reconstruction error.
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
-        sorted_indices = np.argsort(-counts)
+        orig_mag = np.abs((expert_weights.astype(np.uint32) << 16).view(np.float32))
+        mag_weights = np.array([float(orig_mag[exponents == ue].sum()) for ue in unique_exponents],
+                                dtype=np.float64)
+        sorted_indices = np.argsort(-mag_weights)
         palette = unique_exponents[sorted_indices][:16].astype(np.uint8)
 
         # 2. Nearest-neighbour exponent → palette index lookup (all 256 values)
@@ -116,12 +140,38 @@ def encode_palette(weights_uint16: np.ndarray, n_experts: int = 1) -> dict:
             sidecar_indices_all.append(out_pos + expert_offset)
             sidecar_values_all.append(expert_weights[outlier_mask])
 
-        # 4. SM nibble: sign(3) | mantissa_top3(2:0)  — top 3 of 7 mantissa bits
+        # 4. Joint (palette-idx, mantissa) min-error search — mirrors SCLP4/SCLP6 per-block path.
+        # SCLP8: ≤16 palette entries × 8 mantissa levels = ≤128 candidates/weight.
+        # No PBS in the Python reference; compare bf16(bits) directly against orig_f32.
+        orig_f32    = (expert_weights.astype(np.uint32) << 16).view(np.float32)
+        sign_bits   = ((expert_weights >> 15) & 0x1).astype(np.uint16)
+        mant_shift8 = 4   # SCLP8: bits[6:4]
+        mant_levels = 8   # 3 mantissa bits
+
+        best_err  = np.full(len(expert_weights), np.inf, dtype=np.float32)
+        best_idx  = indices.copy()
+        best_mant = ((expert_weights >> mant_shift8) & 0x7).astype(np.uint8)
+
+        for j in range(len(palette)):
+            for m in range(mant_levels):
+                bits = ((sign_bits << 15)
+                        | (palette[j].astype(np.uint16) << 7)
+                        | np.uint16(m << mant_shift8)).astype(np.uint16)
+                recon = (bits.astype(np.uint32) << 16).view(np.float32)
+                err   = np.abs(recon - orig_f32)
+                better = err < best_err
+                best_err  = np.where(better, err,   best_err)
+                best_idx  = np.where(better, j,     best_idx).astype(np.uint8)
+                best_mant = np.where(better, m,     best_mant).astype(np.uint8)
+
+        indices = best_idx
+
+        # 5. SM nibble: sign(3) | mantissa_top3(2:0)  — top 3 of 7 mantissa bits
         sign          = ((expert_weights >> 15) & 0x1).astype(np.uint8)
-        mantissa_top3 = ((expert_weights >> 4)  & 0x7).astype(np.uint8)  # bits 6:4
+        mantissa_top3 = best_mant
         sm_nibbles    = ((sign << 3) | mantissa_top3).astype(np.uint8)
 
-        # 5. Interleaved ws_stream: one byte per weight — idx(high nibble) | smn(low nibble)
+        # 6. Interleaved ws_stream: one byte per weight — idx(high nibble) | smn(low nibble)
         ws_stream = ((indices & 0x0F) << 4 | (sm_nibbles & 0x0F)).astype(np.uint8)
         return palette, ws_stream
 
@@ -557,14 +607,20 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
     def _encode_6b_expert(expert_weights, expert_offset=0, expert_imp=None):
         """Encode a single expert's weights, returning (palette, ws_bytes).
 
-        Palette selection always uses raw exponent frequency. When expert_imp is
-        provided, importance is applied to sidecar selection (see SCLP4 docstring).
+        Palette selection uses magnitude-sum-weighted k-means: each unique exponent
+        is weighted by the total |w| of weights in that bin rather than raw count.
+        This ensures high-magnitude exponents (which dominate reconstruction error)
+        are always covered, even when they are rare compared to near-zero exponents.
+        When expert_imp is provided, importance is applied to sidecar selection
+        (see SCLP4 docstring).
         """
         exponents = ((expert_weights >> 7) & 0xFF).astype(np.uint8)
         unique_exponents, counts = np.unique(exponents, return_counts=True)
 
         if palette_method == 'kmeans':
-            palette = _kmeans_palette(unique_exponents, counts, k=8)
+            mag_w = _mag_sum_weights(unique_exponents, expert_weights)
+            mag_w_scaled = (mag_w / mag_w.max() * 1e6).astype(np.int64)
+            palette = _kmeans_palette(unique_exponents, mag_w_scaled, k=8)
         else:
             sorted_indices = np.argsort(-counts)
             palette = unique_exponents[sorted_indices][:8].astype(np.uint8)
@@ -590,24 +646,42 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
         else:
             outlier_mask = np.zeros(len(expert_weights), dtype=bool)
 
-        # Imatrix-aware discretionary sidecar: ranked by importance × squared
-        # reconstruction error (same logic as SCLP4; see that block for rationale).
-        # Reconstruction: (sign<<15) | (palette[idx]<<7) | (mantissa_top2<<5)
+        # Joint (palette-idx, mantissa) min-error search — mirrors the SCLP4 per-block path.
+        # For each weight try all palette entries × all mantissa levels (≤8×4=32 candidates),
+        # reconstruct bf16(bits) and pick the (idx, mant) minimising |recon - orig|.
+        # No PBS in the Python reference, so compare directly against orig_f32.
+        orig_f32   = (expert_weights.astype(np.uint32) << 16).view(np.float32)
+        sign_bits  = ((expert_weights >> 15) & 0x1).astype(np.uint16)
+        mant_bits_count = 2  # SCLP6: 2 mantissa bits kept
+        mant_shift_6    = 5  # position: bits[6:5]
+        mant_levels     = 1 << mant_bits_count  # 4
+
+        # Build candidate reconstructions: shape (n_weights, palette_size * mant_levels)
+        best_err  = np.full(len(expert_weights), np.inf, dtype=np.float32)
+        best_idx  = indices.copy()
+        best_mant = ((expert_weights >> mant_shift_6) & 0x3).astype(np.uint8)
+
+        for j in range(len(palette)):
+            for m in range(mant_levels):
+                bits = ((sign_bits << 15)
+                        | (palette[j].astype(np.uint16) << 7)
+                        | np.uint16(m << mant_shift_6)).astype(np.uint16)
+                recon = (bits.astype(np.uint32) << 16).view(np.float32)
+                err   = np.abs(recon - orig_f32)
+                better = err < best_err
+                best_err  = np.where(better, err,        best_err)
+                best_idx  = np.where(better, j,          best_idx).astype(np.uint8)
+                best_mant = np.where(better, m,          best_mant).astype(np.uint8)
+
+        indices = best_idx
+
+        # Imatrix-aware discretionary sidecar: ranked by importance × squared best error.
         if expert_imp is not None and sidecar_imatrix_budget > 0.0:
             K_dim = expert_imp.shape[0]
             col_idx = np.arange(len(expert_weights), dtype=np.int64) % K_dim
             per_weight_imp = expert_imp[col_idx]
 
-            # Compute reconstruction error for every weight.
-            sign_bits    = ((expert_weights >> 15) & 0x1).astype(np.uint16)
-            mant_top2    = ((expert_weights >> 5)  & 0x3).astype(np.uint16)
-            recon_bits   = ((sign_bits << 15)
-                            | (palette[indices].astype(np.uint16) << 7)
-                            | (mant_top2 << 5)).astype(np.uint16)
-            orig_f32  = (expert_weights.astype(np.uint32) << 16).view(np.float32)
-            recon_f32 = (recon_bits.astype(np.uint32) << 16).view(np.float32)
-            sq_err    = (orig_f32 - recon_f32) ** 2
-
+            sq_err   = best_err ** 2
             priority = per_weight_imp * sq_err
             priority = np.where(outlier_mask, -np.inf, priority)
             n_extra = int(len(expert_weights) * sidecar_imatrix_budget)
@@ -622,7 +696,7 @@ def encode_palette_6b(weights_uint16: np.ndarray, n_experts: int = 1,
             sidecar_values_all.append(expert_weights[outlier_mask])
 
         sign          = ((expert_weights >> 15) & 0x1).astype(np.uint8)
-        mantissa_top2 = ((expert_weights >> 5)  & 0x3).astype(np.uint8)
+        mantissa_top2 = best_mant
         sixbits = ((indices & 0x7) << 3 | (sign << 2) | (mantissa_top2 & 0x3)).astype(np.uint8)
 
         nw = len(expert_weights)
