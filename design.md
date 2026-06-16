@@ -39,7 +39,7 @@ The exponent's skewed distribution is the key insight shared by ZipServ (arxiv:2
 |---|---|---|
 | ZipServ (AS_PLOS '26) | Fixed-length TCA-TBE bitmap encoding, fused ZipGEMM kernel. Targets consumer GDPR GPUs. ~30% compression, up to 2.21x kernel speedup over cuBLAS. | Direct foundation. TCA-TBE encoding and fused kernel design are the starting point. Extended here with soft clipping, selective compression, and ROCm adaptation. |
 | Cloudflare Unweight | Huffman coding on exponents, four adaptive pipelines, autotuner, selective MLP-only compression. Targets H100 HBM exclusively. 13–22% model reduction, 30–40% throughput overhead currently. | Contributes: selective MLP-only compression strategy, autotuner concept, layer pipelining approach. Huffman encoding is NOT adopted — variable-length decoding is incompatible with SIMT on consumer GPUs. |
-| MX Formats (OCP) | Shared block exponent normalises weights within blocks of 16–32 values. Reduces per-stored-exponent entropy. | Explicitly rejected for this design. Block normalisation spreads residual exponents more uniformly, increasing per-stored-exponent entropy and making lossless compression less effective. |
+| MX Formats (OCP) | Shared block exponent normalises weights within blocks of 16–32 values. Reduces per-stored-exponent entropy. | Originally rejected: block normalisation spreads residual exponents more uniformly, increasing per-stored-exponent entropy and hurting lossless palette compression. **Partially adopted in practice.** SCLP6/SCLP8 ship per-block scaling (PBS): one BF16 scale per 32 weights (`QK_SCLP=32`); the encoder normalises each block by max-abs before palette encoding and the decoder multiplies back. Overhead is +6–8% storage. SCLP4 deliberately omits PBS — normalisation concentrates exponents near 126–127, causing the 4-entry palette to degenerate to ~2-bit scalar quantisation and mode collapse. SCLP4 instead uses a **per-block palette** (each 256-weight block gets its own 4-entry k-means palette), which exploits local exponent variation rather than destroying it. |
 
 ---
 
@@ -58,13 +58,21 @@ Key design decisions:
 - **Per-layer tunable clipping strength:** early and late transformer layers tend to have higher weight variance and tolerate clipping less well than middle layers. Clipping aggressiveness is a per-layer parameter set at preprocessing time, not hardcoded.
 - **Error is bounded and predictable:** unlike quantization, the error introduced is a known function of the clipping threshold and the weight's original exponent, making quality impact analysable before deployment.
 
-### 4.2 Stage 2: Mantissa Truncation (Lossy, Optional)
+### 4.2 Stage 2: Mantissa Truncation (Lossy, Inherent)
 
-Dropping the lowest 2–3 bits of the mantissa makes the mantissa stream more compressible losslessly, and reduces per-weight storage slightly. This stage is optional and should be validated per model before enabling.
+Mantissa precision is a **fixed property of each wire format**, not a per-model toggle. Each SCLP type keeps a defined number of top mantissa bits and silently zeros the rest:
 
-- Error per weight is bounded by `2^(exponent) × 2^(-mantissa_bits)`, which is small for typical weight magnitudes after clipping has normalised the exponent distribution.
+| Type | Mantissa bits kept | Notes |
+|---|---|---|
+| SCLP8 | 3 of 7 | 8 bits/weight: idx4 \| sign1 \| mant3 |
+| SCLP6 | 2 of 7 | 6 bits/weight: idx3 \| sign1 \| mant2 |
+| SCLP5 | 2 of 7 | 5 bits/weight: idx2 \| sign1 \| mant2 |
+| SCLP4 | 1 of 7 | 4 bits/weight: idx2 \| sign1 \| mant1 |
+| SCLP4M | 0 of 7 | Pure magnitude codebook; 8-entry BF16 magnitudes per block |
+
+- Error per weight is bounded by `2^(exponent) × 2^(-mantissa_bits_kept)`, which is small for typical weight magnitudes after clipping has normalised the exponent distribution.
 - Combined with soft exponent clipping, total per-weight error remains small and bounded.
-- The mantissa is otherwise left structurally unchanged — no codebook or learned representation is used in v1.
+- Empirically, low-bit mantissa truncation acts as mild regularisation: Llama-3-8B SCLP8 measures PPL 9.87 vs 10.59 BF16 (lower is better), likely from the smoothing effect on weight magnitudes.
 
 ### 4.3 Stage 3: Fixed-Width 8-Bit Interleaved Encoding (Lossless-First)
 
@@ -206,12 +214,14 @@ While the GPU computes layer N's GEMM, a separate HIP stream decodes layer N+1's
 | Model size (Gemma4-26B, mixed SCLP6+SCLP4) | 17.0 GiB (vs 48 GB BF16) |
 | Quality (Llama-3-8B SCLP8) | PPL 9.87 vs 10.59 BF16 (improved, likely from mantissa truncation regularization) |
 | Quality (Gemma4 mixed, OOD agentic) | PPL 26.6 (vs 18,481 Q5_K_M on wikitext) |
-| Generation speed (Llama-3-8B SCLP8) | ~66 t/s vs ~52 t/s BF16 (27% faster, reads half the bytes) |
+| Generation speed (Llama-3-8B, RX 7900 XTX) | SCLP4 26.8 t/s · SCLP5 28.9 · SCLP4M ~31 · SCLP6 34.2 · SCLP8 40.6 (llama-bench tg128, sidecar v2). The folded-sidecar fold costs ~7% on SCLP8 (40.6 folded vs 43.9 no-fold); the earlier ~66 figure pre-dates sidecar folding and is not reproducible under llama-bench. SCLP4/5/6 numbers predate the v2 sidecar and may be similarly higher. |
+| Prefill speed (Llama-3-8B SCLP8) | ~2,730 t/s (pp); lags Q8_0 because two-pass decode adds a full weight-matrix read before the rocBLAS GEMM. |
 
 ---
 
 ## 9. Key Risks and Open Questions
 
+- **Evaluation methodology:** Wikitext-2 PPL is OOD-inflated ~50× on instruction-tuned models (e.g., a healthy Gemma4-IT reads ~50–200 on wikitext; use rankings, not absolutes). PPL alone has silently missed mode collapse in past SCLP iterations. **Recommended quality gate:** (1) KL-divergence against BF16 logits (`llama-perplexity --kl-divergence`) as the primary scalar signal — a sudden KL spike is the earliest indicator of collapse; (2) a 200+ token free-generation chat smoke test before declaring any new quant good, because perplexity can look reasonable while the model loops or degenerates.
 - **Clipping Sensitivity:** Per-layer clipping sensitivity is theoretically bounded but empirically unknown for specific models.
 - **RDNA3 MFMA occupancy:** The combined LDS requirements of the palette buffer and MFMA tile buffers may force lower wavefront occupancy than expected.
 - **Speculative decoding acceptance rate variability:** Effectiveness depends on the match between draft network and base model distribution.
